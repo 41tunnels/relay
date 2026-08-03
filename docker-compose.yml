@@ -11,8 +11,8 @@ services:
       RELAY_LOG_FORMAT: "json"
       RELAY_MAX_PAIRS: "10000"
     ports:
-      - "127.0.0.1:8080:8080" # reverse proxy fronts this
-      - "127.0.0.1:9091:9091" # metrics: never public
+      - 3849:8080 # reverse proxy fronts this
+      - 3850:9091 # metrics: never public
     ulimits:
       nofile:
         soft: 65535
