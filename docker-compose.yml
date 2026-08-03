@@ -1,0 +1,32 @@
+services:
+  relay:
+    image: tehfonsi/opencharui_relay:latest
+    container_name: opencharui-relay
+    restart: unless-stopped
+    environment:
+      RELAY_ADDR: ":8080"
+      RELAY_METRICS_ADDR: ":9091"
+      RELAY_ALLOWED_ORIGINS: "opencharui.github.io,localhost:*,127.0.0.1:*"
+      RELAY_TRUST_PROXY: "true"
+      RELAY_LOG_FORMAT: "json"
+      RELAY_MAX_PAIRS: "10000"
+    ports:
+      - "127.0.0.1:8080:8080" # reverse proxy fronts this
+      - "127.0.0.1:9091:9091" # metrics: never public
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - "no-new-privileges:true"
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

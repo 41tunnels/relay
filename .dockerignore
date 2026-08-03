@@ -1,0 +1,6 @@
+.git
+.github
+*.md
+docker-compose.yml
+Caddyfile.example
+testdata

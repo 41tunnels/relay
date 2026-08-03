@@ -1,0 +1,20 @@
+relay.opencharui.com {
+	# Caddy v2 proxies WebSocket upgrades transparently — no matcher needed.
+	# Deliberately NO `encode` (payloads past the handshake are AES-GCM
+	# ciphertext — incompressible, and compressing plaintext ahead of
+	# encryption is a CRIME-shaped hazard) and NO transport timeouts
+	# (sessions are long-lived; Caddy has no idle timeout by default, which
+	# is exactly what's needed for a socket an agent parks for hours).
+	reverse_proxy 127.0.0.1:8080
+
+	log {
+		output file /var/log/caddy/relay.log
+		format json
+	}
+}
+
+# If this host instead fronts things with nginx-proxy-manager or Traefik
+# rather than Caddy, check the idle/read timeout explicitly — nginx's
+# default 60s proxy_read_timeout will silently kill parked agent sockets,
+# which is exactly the failure mode this Caddy config avoids by having no
+# idle timeout at all.

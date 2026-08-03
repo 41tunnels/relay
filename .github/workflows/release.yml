@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    branches: [release/latest]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-latest
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Raw-CLI login, same convention as flwkt_website, but --password-stdin
+      # so the secret never lands in the process list or docker's own
+      # command-line history.
+      - name: Log in to Docker Hub
+        run: echo "${{ secrets.DOCKERHUB_PASSWORD }}" | docker login -u tehfonsi --password-stdin
+
+      - name: Build and push
+        run: |
+          SHA="${GITHUB_SHA::12}"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg VERSION="$SHA" \
+            --tag tehfonsi/opencharui_relay:latest \
+            --tag "tehfonsi/opencharui_relay:$SHA" \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            --provenance=false \
+            --push .
+
+      - name: Log out
+        if: always()
+        run: docker logout
