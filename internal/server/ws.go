@@ -140,6 +140,19 @@ func (s *Server) serveAgent(ctx context.Context, id hub.PairID, conn *hub.Conn) 
 
 	s.pump(ctx, pair, conn)
 
+	// Shutdown() (see server.go) already broadcasts going_away and closes
+	// every tracked connection itself, including this one — that close is
+	// exactly what just unblocked pump()'s Read above. Falling through to
+	// the ordinary "agent disappeared" cleanup here would race Shutdown's
+	// own close of the client connection: whichever goroutine wins can
+	// clobber the client's going_away close code with agent_gone,
+	// depending on map-iteration order and scheduling. During a shutdown,
+	// Shutdown already owns every connection's notification and close, so
+	// skip the redundant (and racy) path entirely.
+	if s.shuttingDown.Load() {
+		return
+	}
+
 	client, removed := s.hub.RemoveIfAgent(id, conn)
 	if removed {
 		s.m.PairsActive.Set(float64(s.hub.Len()))
@@ -168,6 +181,14 @@ func (s *Server) serveClient(ctx context.Context, id hub.PairID, conn *hub.Conn)
 	s.notifyPeerOnline(pair, conn)
 
 	s.pump(ctx, pair, conn)
+
+	// See the matching comment in serveAgent: during a shutdown, Shutdown()
+	// already owns notifying and closing every connection, so the ordinary
+	// "client disappeared, tell the agent peer_offline" path is both
+	// redundant and racy here.
+	if s.shuttingDown.Load() {
+		return
+	}
 
 	if pair.ClearClient(conn) {
 		if peer := pair.Peer(wire.RoleClient); peer != nil {
