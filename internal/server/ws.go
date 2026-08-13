@@ -134,8 +134,12 @@ func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request, role wire
 	conn.SetGrant(grant)
 	s.m.HandshakeDuration.Observe(time.Since(handshakeStart).Seconds())
 
+	// hello_ok is deliberately NOT sent here. It means "you are attached
+	// and reachable", so each serve path sends it once its registration
+	// has landed — otherwise an agent can act on the acknowledgement
+	// before its pair or token hash resolves, and a request arriving in
+	// that window fails as though the pair were gone or the key wrong.
 	sessionStart := time.Now()
-	s.sendHelloOK(conn)
 
 	switch {
 	case role == wire.RoleAgent && mode == wire.ModeHTTP:
@@ -169,6 +173,8 @@ func (s *Server) serveAgent(ctx context.Context, id hub.PairID, conn *hub.Conn) 
 	s.m.ConnectionsActive.WithLabelValues("agent", conn.Grant().Tier).Inc()
 	defer s.m.ConnectionsActive.WithLabelValues("agent", conn.Grant().Tier).Dec()
 
+	// Attached: a client looking this pair up now finds it.
+	s.sendHelloOK(conn)
 	s.notifyPeerOnline(pair, conn)
 
 	s.pump(ctx, pair, nil, conn)
@@ -253,6 +259,10 @@ func (s *Server) serveDualAgent(ctx context.Context, id hub.PairID, conn *hub.Co
 	s.m.ConnectionsActive.WithLabelValues(kind, conn.Grant().Tier).Inc()
 	defer s.m.ConnectionsActive.WithLabelValues(kind, conn.Grant().Tier).Dec()
 
+	// Both registrations have landed: the pair resolves for a client and,
+	// unless the lane degraded, the token hash resolves for an HTTP
+	// request. Only now is the acknowledgement true.
+	s.sendHelloOK(conn)
 	s.notifyPeerOnline(pair, conn)
 
 	s.pump(ctx, pair, httpPair, conn)
@@ -276,6 +286,13 @@ func (s *Server) serveDualAgent(ctx context.Context, id hub.PairID, conn *hub.Co
 }
 
 func (s *Server) serveClient(ctx context.Context, id hub.PairID, conn *hub.Conn) {
+	// Sent before the lookup, unlike the agent paths: a client's own
+	// attachment is what the *agent* waits on, and `notifyPeerOnline`
+	// already handles either order, so there is no window to close here.
+	// Keeping it first also preserves the sequence existing clients see
+	// when no agent is attached — hello_ok, then error, then 4404.
+	s.sendHelloOK(conn)
+
 	pair, ok := s.hub.Lookup(id)
 	if !ok {
 		s.sendControl(conn, wire.NewError(wire.ErrAgentOffline))

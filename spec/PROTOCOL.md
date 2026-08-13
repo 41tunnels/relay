@@ -89,6 +89,20 @@ protocol violation (`4400`); a client sending `rekey` is likewise `4400`.
 {"t":"going_away","retry_after_ms":2000}
 ```
 
+`hello_ok` means **attached and reachable**, not merely "your hello
+parsed". A relay MUST NOT send it to an agent until that agent is
+registered — under its `pair` for the E2E lane, its `token_hash` for the
+HTTP lane, and both for `mode:"dual"` (§11.3). Everything an agent does
+next assumes it: a request arriving in the window between a premature
+acknowledgement and the registration landing would be answered as though
+the pair were gone (`4404`) or the key were wrong (`401`), for a
+connection that is in fact healthy. An agent that cannot be attached is
+closed instead, without `hello_ok`.
+
+A client is acknowledged as soon as its hello is accepted, before the pair
+lookup: nothing the client does depends on its own registration, and
+`peer_online` already resolves either attachment order.
+
 `peer_online`/`peer_offline` are required triggers, not just UX — see §5
 (session lifecycle). A relay that withholds `peer_online` causes a stalled
 connection, never a compromise; the E2E handshake (§4) is what actually

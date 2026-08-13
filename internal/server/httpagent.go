@@ -44,6 +44,11 @@ func (s *Server) serveHTTPAgent(ctx context.Context, id hub.PairID, conn *hub.Co
 		"live", s.httpReg.Len(),
 	)
 
+	// Registered: the key resolves, so an HTTP request arriving the
+	// instant the agent sees this acknowledgement is routable rather than
+	// answered with a spurious "incorrect API key".
+	s.sendHelloOK(conn)
+
 	// Shares the one pump with every other connection kind; passing a nil
 	// Pair is what makes a session frame (0x01/0x02) a protocol violation
 	// here, since this connection has no peer and no session.
