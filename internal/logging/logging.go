@@ -51,3 +51,17 @@ func PairTag(pairID [16]byte) string {
 	sum := sha256.Sum256(pairID[:])
 	return hex.EncodeToString(sum[:4])
 }
+
+// TokenTag is PairTag's equivalent for an API key's hash (spec §11):
+// the correlation id logged in place of the full token_hash.
+//
+// The hash cannot be inverted to a usable key, so this is not the same
+// secrecy requirement PairTag carries — it exists so log lines stay
+// skimmable and so no single field is long enough to tempt anyone into
+// treating it as an identifier to pass around. The raw API KEY, which is
+// a bearer capability, must never reach a log line in any form: it
+// arrives in a request path or an Authorization header, and both are
+// stripped before logging (see the Caddyfile's uri filter).
+func TokenTag(tokenHash [32]byte) string {
+	return hex.EncodeToString(tokenHash[:4])
+}

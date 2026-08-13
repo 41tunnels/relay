@@ -16,6 +16,14 @@ const (
 	ChannelControl   Channel = 0x00
 	ChannelCiphertext Channel = 0x01
 	ChannelHandshake Channel = 0x02
+	// ChannelPlain carries inner frames (§6) with no AEAD wrapping, and
+	// exists solely for the OpenAI-compatible HTTP endpoint (§11): there,
+	// the caller is an arbitrary third-party client with no PSK, so the
+	// relay itself originates requests and necessarily sees plaintext.
+	// It is only ever valid on a connection that declared mode:"http" in
+	// its hello — an E2E session (0x01) must never accept or emit it, and
+	// the server rejects it on any other connection with close 4400.
+	ChannelPlain Channel = 0x03
 )
 
 const (

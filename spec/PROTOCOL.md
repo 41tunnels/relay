@@ -40,13 +40,19 @@ Every binary WS message is one outer frame:
 
 | Field | Meaning |
 |---|---|
-| `channel` | `0x00` = control (JSON, relay-visible), `0x01` = ciphertext (opaque to relay), `0x02` = handshake (plaintext, still opaque to relay) |
+| `channel` | `0x00` = control (JSON, relay-visible), `0x01` = ciphertext (opaque to relay), `0x02` = handshake (plaintext, still opaque to relay), `0x03` = plain inner frames (relay-visible, §11 only) |
 | `flags` | bit 0 = `conn_id` present. **RESERVED, MUST be 0 in v1.** Bits 1-7 reserved, MUST be 0. |
 | `conn_id` | Reserved for a future multi-peer extension (§9). Absent in v1. |
 
 Receivers MUST reject any message with non-zero reserved flag bits (close
-`4400 bad_frame`). The relay parses only the `channel` and `flags` bytes; it
-never inspects the payload of channel `0x01` or `0x02`.
+`4400 bad_frame`), and any channel above `0x03`, which v1 does not define.
+The relay parses only the `channel` and `flags` bytes; it never inspects
+the payload of channel `0x01` or `0x02`. It does read `0x03`, which is the
+whole reason that channel is separate — see §11.1.
+
+Which channels are valid on a given connection depends on what its hello
+asked for (§11.3); a frame for a lane the connection does not carry is
+`4400`.
 
 Maximum outer frame size: `RELAY_MAX_FRAME_BYTES` (default 1 MiB, relay-
 enforced). Oversize → close `4413 frame_too_large`.
@@ -60,11 +66,18 @@ produces these.
 
 ```json
 {"t":"hello","v":1,"role":"agent"|"client","pair":"<base64url,16 bytes>","token":""}
+{"t":"rekey","token_hash":"<base64url,32 bytes>"|""}
 ```
 
 `token` is reserved for future subscription gating (§9) and MUST be sent as
 `""` in v1. `pair` is the pairing ID from the QR/manual code, base64url
 without padding.
+
+`hello` MUST be the first frame on every connection. `rekey` is the only
+control message either side may send after it, it is **agent-only**, and
+it belongs entirely to §11.3 — a relay that does not implement §11 MUST
+ignore it rather than close. Any other post-hello control frame is a
+protocol violation (`4400`); a client sending `rekey` is likewise `4400`.
 
 ### Relay → client/agent
 
@@ -192,7 +205,25 @@ both:   on receiving+verifying peer CONFIRM -> session established
 
 `peer_offline` (either side drops) → zero all session key material, abort
 every open stream (§6), return to the wait state. Keys are never reused
-across a reconnect — a fresh HELLO/CONFIRM runs every time.
+across sessions — a fresh HELLO/CONFIRM runs every time.
+
+**A session's lifetime is not the connection's.** `peer_offline` ends the
+session; it does not end the connection, and an agent MUST NOT reconnect
+in response to one. The wait state is an ordinary steady state: the next
+`peer_online` starts a fresh handshake on the same socket, and on a
+`mode:"dual"` connection (§11.3) the HTTP lane keeps serving throughout —
+including before any browser has ever attached.
+
+Two consequences for implementers:
+
+- Ciphertext MAY arrive before the local side has finished installing its
+  session, because a peer sends its first request as soon as it has
+  verified the last CONFIRM. A receiver MUST NOT treat that as an error;
+  hold such frames and open them, in arrival order, once the session is
+  installed. Dropping them strands a request the peer considers sent, and
+  §5's exact-counter rule leaves no freedom about the order.
+- Ciphertext arriving with no session established *and none in progress*
+  remains fatal (`4401`): there is no key to authenticate it with.
 
 ## 5. Ciphertext channel (0x01)
 
@@ -229,8 +260,15 @@ the two plaintexts. This is not a performance-tuning suggestion; it is a
 correctness requirement.
 
 - Counter exhaustion (would exceed 2^64-1, in practice: never, but treat
-  overflow as fatal) is a hard connection close, never a wrap.
-- Session keys are never reused across a reconnect.
+  overflow as fatal) ends the session, never wraps. On a connection that
+  outlives its session (§4.6) an implementation MAY retire just the
+  session and keep the socket; it MUST NOT continue sealing.
+- Session keys are never reused across sessions, including two successive
+  sessions on one connection.
+- The sealing point is per *session*, not per connection: when a session
+  is installed, the new key and a counter starting at zero replace the
+  previous pair atomically, so no frame can be sealed with a key its
+  counter did not start under.
 
 ## 6. Inner frames (carried inside decrypted channel-0x01 payloads)
 
@@ -332,3 +370,251 @@ future incompatible change increments this and both the MAC and transcript
 computation are versioned along with it — old and new versions MUST NOT be
 mutually intelligible past the HELLO stage (this is a feature, not a gap:
 downgrade attacks are defeated by binding `ver` into the MAC).
+
+## 11. OpenAI-compatible HTTP endpoint
+
+A second, **optional** agent protocol that makes an agent's Ollama
+reachable by any OpenAI-compatible client (Open WebUI, Cursor, Continue,
+LibreChat, an SDK) with nothing but a base URL and an API key.
+
+### 11.1 Why this path is not end-to-end encrypted
+
+Everything in §4-§5 depends on both peers holding the PSK. An unmodified
+third-party OpenAI client holds nothing. There is therefore no key to
+derive a session from, and no arrangement of this protocol in which the
+relay both routes such a request and is unable to read it.
+
+So on this path the relay sees plaintext prompts and completions. That is
+a deliberate trade, not an oversight, and it is why:
+
+- the agent-side setting that enables it **defaults to off**;
+- the agent MUST state the trade-off where the user enables it, since the
+  URL itself cannot: this endpoint shares the relay's hostname (one
+  origin, one certificate, and the agent derives the HTTP base URL from
+  the relay URL by swapping the scheme), so nothing about the address
+  distinguishes it from the encrypted path;
+- §11.5's allowlist is strictly smaller than the E2E path's.
+
+An agent that never enables this has no HTTP registry entry, and the
+entire section is inert for it.
+
+**The E2E path's guarantees are unchanged by this section.** The two lanes
+use different channels, different registries, and different allowlists,
+and an agent MAY carry both on one socket (`mode:"dual"`, §11.3). Sharing
+a socket means sharing a fate — one drops, both drop — and nothing else:
+no plaintext frame is ever opened with a session key, no §11.5 request
+ever reaches the E2E allowlist, and the lanes are charged against separate
+rate budgets so traffic on one cannot close the other.
+
+### 11.2 Keys and their hashes
+
+The agent generates an API key (`41t_` ‖ base64url of 32 random bytes) and
+publishes only `base64url(SHA-256(key))` to the relay. The relay indexes
+hashes and never stores a usable key.
+
+This bounds what an offline leak of the relay's index is worth. It does
+**not** protect against a live relay compromise — the key arrives in
+cleartext on every request, as does the prompt. Do not oversell it.
+
+Rotation is in place: the agent issues a new key and republishes its hash
+with `rekey` (§11.3), the relay re-indexes, and the previous key stops
+resolving. The relay stays stateless — the agent is the source of truth
+for which keys exist.
+
+Rotation MUST NOT require a reconnect. On a `mode:"dual"` connection the
+socket also carries a paired browser's session, and revoking an API key is
+no reason to interrupt someone's chat.
+
+### 11.3 Agent connection
+
+Same endpoint as any agent (`GET /v1/agent`), distinguished by the hello:
+
+```json
+{"t":"hello","v":1,"role":"agent","pair":"<base64url,16 bytes>",
+ "token":"","mode":"dual","token_hash":"<base64url,32 bytes>"}
+```
+
+`mode` selects which lanes the connection carries:
+
+| `mode` | E2E lane (0x01/0x02) | HTTP lane (0x03) | Registered under |
+|---|---|---|---|
+| absent / `"e2e"` | yes | no | `pair` |
+| `"http"` | no | yes | `token_hash` |
+| `"dual"` | yes | yes | both |
+
+- `"http"` and `"dual"` are **agent-only**. A client declaring either is
+  closed with `4400`.
+- A relay MUST treat an unrecognised `mode` as `"e2e"` rather than
+  rejecting it. That leniency is what lets a newer agent roll out against
+  an older relay and still get its pairing, losing only the lane the old
+  relay cannot route.
+- `token_hash` is required for `"http"` and `"dual"`, and meaningless
+  otherwise.
+
+For `"http"`, `pair` is only a correlation id for logs and metrics —
+routing is by `token_hash` alone and the connection is never registered in
+the pair_id map. For `"dual"` it is both: the connection occupies its
+pair_id slot *and* its token_hash slot, and displacement in one does not
+imply displacement in the other.
+
+`"dual"` is the mode an agent that serves both a paired browser and the
+OpenAI endpoint SHOULD use. Opening two sockets that reuse one `pair_id`
+is a defect, not an alternative: both register as the agent for that pair
+and displace each other in a loop.
+
+A relay that cannot provide the HTTP lane for a `"dual"` connection — the
+endpoint is disabled, the token hash is malformed, the token registry is
+full — MUST degrade it to `"e2e"` and serve the pairing, not close the
+connection. The pairing is the socket's primary job; the HTTP lane is an
+add-on, and a user must not lose their browser session to an operator
+setting or a bad hash. (`"http"` has nothing to degrade to and is closed
+with `4503`.)
+
+For the E2E lane, §4.6's session lifecycle applies unchanged. The HTTP
+lane has no HELLO/CONFIRM exchange and generates no
+`peer_online`/`peer_offline`: its peer is the relay's own HTTP handler,
+which exists per request rather than as a socket. On a `"dual"`
+connection the peer notifications therefore refer only to the browser.
+
+**Rekey.** An agent republishes the hash it currently accepts without
+reconnecting:
+
+```json
+{"t":"rekey","token_hash":"<base64url,32 bytes>"}
+{"t":"rekey","token_hash":""}
+```
+
+- The relay re-indexes the connection's registry entry under the new hash.
+  The previous hash stops resolving immediately.
+- An empty `token_hash` removes the entry from the index entirely, which
+  is how the endpoint is switched off. A later `rekey` restores it.
+- Every in-flight request on the HTTP lane MUST be torn down, in both
+  cases. Those requests were authorised under a key that no longer exists,
+  and answering them would outlive the revocation.
+- The E2E lane MUST be untouched: no session teardown, no `peer_offline`,
+  no reconnect.
+- A relay MUST refuse a `token_hash` already held by a *different* entry,
+  and leave both entries as they were. Computing another agent's hash
+  requires already holding its key, so this is not much of an escalation —
+  but without the check, publishing one would take over its routing.
+- A `rekey` on a connection with no HTTP lane (a plain E2E agent, or a
+  degraded `"dual"` one) MUST be ignored, not closed.
+
+### 11.4 Channel 0x03
+
+Inner frames (§6) with no AEAD wrapping:
+
+```
+[channel=0x03][flags=0x00][inner frames...]
+```
+
+Inner frame semantics, stream-id parity, and CANCEL rules are exactly §6
+and §6.1. The relay allocates odd stream ids, one per in-flight HTTP
+request, and demultiplexes the RESP family back to the request that owns
+each id.
+
+A frame is valid only on a connection that carries its lane (§11.3's
+table); anything else is `4400`. Concretely: 0x03 MUST NOT appear on an
+`"e2e"` connection, 0x01/0x02 MUST NOT appear on an `"http"` one, and a
+`"dual"` connection accepts all three. This is enforced by the relay and
+by both endpoints, not by the endpoints alone.
+
+The lanes are charged against **separate byte budgets**. One socket must
+not mean one budget: a rate limit shared between them would let a
+third-party client hammering inference exhaust the pair's allowance and
+close the socket the user's browser depends on.
+
+On a `"dual"` connection the receiver decides how to treat a frame from
+its channel alone, before parsing the payload — a 0x03 frame is dispatched
+against §11.5's allowlist and a 0x01 frame against the E2E one, and no
+input can move a frame from one to the other.
+
+Because there is no AEAD, §5.1's nonce discipline does not apply here —
+there is no counter and no sealing point. The single-writer requirement
+still holds for ordinary WebSocket framing reasons.
+
+### 11.5 Request surface
+
+The agent MUST enforce a smaller allowlist than the E2E path's:
+
+| Method | Path |
+|---|---|
+| `POST` | `/v1/chat/completions` |
+| `POST` | `/v1/completions` |
+| `POST` | `/v1/embeddings` |
+| `GET`  | `/v1/models` |
+| `GET`  | `/v1/models/{id}` |
+
+Ollama serves all of these natively; nothing needs translating.
+
+Note what is absent. `/api/pull` and `/api/delete` are on the E2E
+allowlist, and a leaked key that reached them could make the machine
+download a 70B model or destroy its model library. A leaked key must cost
+the user inference cycles and nothing more.
+
+The caller's `Authorization` header authenticates them to the *relay* and
+MUST NOT be forwarded; the agent stamps its own bearer token for its local
+router, exactly as on the E2E path.
+
+### 11.6 Client-facing URL
+
+Both forms resolve the same key, and a relay MUST accept both:
+
+```
+https://<host>/<key>/v1/chat/completions      # key as first path segment
+https://<host>/v1/chat/completions            # key as Authorization: Bearer
+```
+
+The path form exists because some clients accept only a base URL. It has a
+real cost — a key in a URL reaches access logs, `Referer` headers, and
+browser history — so a deploy MUST redact keys from its access logs, and
+browser-based clients SHOULD be pointed at the bearer form.
+
+Redaction MUST match the key prefix (`^/41t_[^/?]+`) rather than "any
+first path segment": the same hostname serves `/v1/agent`, `/v1/client`
+and `/healthz`, whose first segment is meaningful and must stay readable.
+The bearer form carries no secret in the URL and needs no redaction.
+
+A first path segment of `v1`, `healthz`, or `metrics` is reserved and is
+never interpreted as a key.
+
+Relays SHOULD normalize a doubled `/v1/v1/` and repeated slashes rather
+than 404: both are routine artifacts of clients concatenating a base URL.
+
+### 11.7 Error mapping
+
+Responses MUST use the OpenAI error envelope, or clients surface an opaque
+parse failure instead of the reason:
+
+```json
+{"error":{"message":"...","type":"...","code":"..."}}
+```
+
+| Condition | Status | `code` |
+|---|---|---|
+| No key supplied, or key not in the index | `401` | `invalid_api_key` |
+| Key known, agent not connected | `503` | `agent_offline` |
+| Per-key concurrency cap reached | `429` | `rate_limit_exceeded` |
+| Agent rejected the path (§11.5) | `403` | `forbidden` |
+| Agent did not send RESP in time | `504` | `agent_timeout` |
+| Agent detached mid-request | `503` | `agent_offline` |
+
+The `401`/`503` split is required, not cosmetic: "your machine is asleep"
+and "your API key is wrong" are different problems and a user cannot act
+on the wrong one. It obliges the relay to keep a key resolvable for a
+grace period after its agent disconnects (a tombstone). This does leak a
+small oracle — an attacker can distinguish a real-but-offline key from a
+nonexistent one — which is an accepted trade for the UX, not an oversight.
+
+### 11.8 Streaming
+
+`RESP_BODY` frames MUST be flushed to the HTTP response as they arrive;
+buffering collapses a token stream into one blob at the end and defeats
+the endpoint's purpose. Any proxy in front MUST have response buffering
+and compression disabled.
+
+A cold model load routinely exceeds a client's default read timeout. Once
+headers are sent and the response is `text/event-stream`, a relay MAY emit
+`: keepalive\n\n` comment lines during gaps — legal no-ops to every SSE
+parser. Before headers there is nothing legal to send, so that window is
+bounded by a timeout instead (§11.7's `agent_timeout`).

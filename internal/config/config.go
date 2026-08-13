@@ -33,6 +33,34 @@ type Config struct {
 	IPConnPerMin        int
 	TrustProxy          bool
 
+	// OpenAI-compatible HTTP endpoint (spec §11). Serving the route costs
+	// nothing when no agent opts in — an agent must connect in mode:"http"
+	// with a token hash before any key resolves — but HTTPEnabled exists so
+	// a deploy can refuse the whole surface outright.
+	HTTPEnabled bool
+	// HTTPMaxInFlight caps concurrent requests per key. One consumer GPU
+	// thrashes badly past a handful of parallel generations, so shedding
+	// with 429 beats queueing without bound.
+	HTTPMaxInFlight int
+	// HTTPTombstoneTTL is how long a key stays resolvable after its agent
+	// disconnects, so the endpoint can answer 503 "offline" instead of 401
+	// "bad key". Past this, the entry is evicted and the key reads as
+	// unknown until the agent reconnects.
+	HTTPTombstoneTTL time.Duration
+	// HTTPFirstByteTimeout bounds the wait for the agent's RESP. Generous
+	// by default: a cold model load on a sleeping laptop is slow, and the
+	// failure mode of being too tight is a confusing 504 on a request that
+	// would have succeeded.
+	HTTPFirstByteTimeout time.Duration
+	// HTTPKeepaliveInterval is the gap after which an SSE response emits a
+	// comment line to keep intermediaries and client read timeouts from
+	// giving up during a long pause. Zero disables it.
+	HTTPKeepaliveInterval time.Duration
+	// HTTPStreamBuffer is the per-request response-frame buffer. Small on
+	// purpose — see hub.Stream on why buffering here would defeat
+	// backpressure rather than improve throughput.
+	HTTPStreamBuffer int
+
 	LogLevel  string // "debug"|"info"|"warn"|"error"
 	LogFormat string // "json"|"text"
 }
@@ -55,8 +83,16 @@ func Defaults() Config {
 		PairRateBytesPerSec: 8 << 20, // 8 MiB/s
 		IPConnPerMin:        60,
 		TrustProxy:          true,
-		LogLevel:            "info",
-		LogFormat:            "json",
+
+		HTTPEnabled:           true,
+		HTTPMaxInFlight:       8,
+		HTTPTombstoneTTL:      24 * time.Hour,
+		HTTPFirstByteTimeout:  180 * time.Second,
+		HTTPKeepaliveInterval: 15 * time.Second,
+		HTTPStreamBuffer:      8,
+
+		LogLevel:  "info",
+		LogFormat: "json",
 	}
 }
 
@@ -105,6 +141,24 @@ func Load() (Config, error) {
 	if err := setBool("RELAY_TRUST_PROXY", &c.TrustProxy); err != nil {
 		return Config{}, err
 	}
+	if err := setBool("RELAY_HTTP_ENABLED", &c.HTTPEnabled); err != nil {
+		return Config{}, err
+	}
+	if err := setInt("RELAY_HTTP_MAX_INFLIGHT", &c.HTTPMaxInFlight); err != nil {
+		return Config{}, err
+	}
+	if err := setDuration("RELAY_HTTP_TOMBSTONE_TTL", &c.HTTPTombstoneTTL); err != nil {
+		return Config{}, err
+	}
+	if err := setDuration("RELAY_HTTP_FIRST_BYTE_TIMEOUT", &c.HTTPFirstByteTimeout); err != nil {
+		return Config{}, err
+	}
+	if err := setDuration("RELAY_HTTP_KEEPALIVE_INTERVAL", &c.HTTPKeepaliveInterval); err != nil {
+		return Config{}, err
+	}
+	if err := setInt("RELAY_HTTP_STREAM_BUFFER", &c.HTTPStreamBuffer); err != nil {
+		return Config{}, err
+	}
 	if v, ok := lookup("RELAY_LOG_LEVEL"); ok {
 		c.LogLevel = v
 	}
@@ -148,6 +202,18 @@ func (c Config) Validate() error {
 	}
 	if c.IPConnPerMin <= 0 {
 		return fmt.Errorf("config: RELAY_IP_CONN_PER_MIN must be positive, got %d", c.IPConnPerMin)
+	}
+	if c.HTTPMaxInFlight <= 0 {
+		return fmt.Errorf("config: RELAY_HTTP_MAX_INFLIGHT must be positive, got %d", c.HTTPMaxInFlight)
+	}
+	if c.HTTPTombstoneTTL <= 0 {
+		return fmt.Errorf("config: RELAY_HTTP_TOMBSTONE_TTL must be positive, got %s", c.HTTPTombstoneTTL)
+	}
+	if c.HTTPFirstByteTimeout <= 0 {
+		return fmt.Errorf("config: RELAY_HTTP_FIRST_BYTE_TIMEOUT must be positive, got %s", c.HTTPFirstByteTimeout)
+	}
+	if c.HTTPStreamBuffer <= 0 {
+		return fmt.Errorf("config: RELAY_HTTP_STREAM_BUFFER must be positive, got %d", c.HTTPStreamBuffer)
 	}
 	switch c.LogLevel {
 	case "debug", "info", "warn", "error":

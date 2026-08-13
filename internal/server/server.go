@@ -24,12 +24,13 @@ import (
 )
 
 type Server struct {
-	cfg   config.Config
-	hub   *hub.Hub
-	authz auth.Authorizer
-	ipLim *limits.IPLimiter
-	m     *metrics.Metrics
-	log   *slog.Logger
+	cfg     config.Config
+	hub     *hub.Hub
+	httpReg *hub.HTTPRegistry
+	authz   auth.Authorizer
+	ipLim   *limits.IPLimiter
+	m       *metrics.Metrics
+	log     *slog.Logger
 
 	connSeq atomic.Uint64
 
@@ -54,6 +55,16 @@ func New(cfg config.Config, h *hub.Hub, authz auth.Authorizer, ipLim *limits.IPL
 		m:     m,
 		log:   log,
 		conns: make(map[*hub.Conn]struct{}),
+		// Constructed here rather than injected: it is an implementation
+		// detail of the HTTP endpoint, not something a caller configures
+		// independently of cfg.
+		httpReg: hub.NewHTTPRegistry(
+			cfg.MaxPairs,
+			cfg.PairRateBytesPerSec,
+			cfg.HTTPTombstoneTTL,
+			cfg.HTTPMaxInFlight,
+			cfg.HTTPStreamBuffer,
+		),
 	}
 }
 
@@ -65,6 +76,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/agent", s.handleAgentUpgrade)
 	mux.HandleFunc("/v1/client", s.handleClientUpgrade)
 	mux.HandleFunc("/healthz", s.handleHealthz)
+	if s.cfg.HTTPEnabled {
+		// Catch-all, so both URL shapes land here: /{token}/v1/... and a
+		// bare /v1/... with the key in the Authorization header. The three
+		// patterns above are more specific and still win under ServeMux's
+		// precedence rules, and openai.go additionally refuses to read a
+		// reserved first segment as a token.
+		mux.HandleFunc("/", s.handleOpenAI)
+	}
 	return mux
 }
 
@@ -81,7 +100,15 @@ func (s *Server) Run(ctx context.Context) error {
 // Serve runs the server on an already-open listener — split out from Run
 // so tests can use a listener bound to an ephemeral port.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	// No global write/idle timeouts: a streamed completion legitimately
+	// runs for minutes with long gaps between tokens, and an http.Server
+	// timeout would cut it mid-stream. Per-request bounds live in the
+	// handler (HTTPFirstByteTimeout) and per-write in cfg.WriteTimeout.
 	s.httpSrv = &http.Server{Handler: s.Handler()}
+
+	sweepCtx, cancelSweep := context.WithCancel(ctx)
+	defer cancelSweep()
+	go s.sweepHTTPTombstones(sweepCtx)
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- s.httpSrv.Serve(ln) }()

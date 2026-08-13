@@ -21,6 +21,45 @@ type Hello struct {
 	Role  Role   `json:"role"`
 	Pair  string `json:"pair"`  // base64url, no padding, 16 raw bytes
 	Token string `json:"token"` // reserved, "" in v1
+
+	// Mode selects which agent protocol this connection speaks (§11).
+	// "" and ModeE2E are the ordinary PSK-handshake pairing that serves
+	// the web PWA; ModeHTTP is the OpenAI-compatible endpoint alone;
+	// ModeDual is both at once over a single socket, which is what amallo
+	// opens. Clients never set this.
+	Mode Mode `json:"mode,omitempty"`
+	// TokenHash is the base64url SHA-256 of the API key the agent is
+	// currently accepting, sent with ModeHTTP and ModeDual. The relay
+	// indexes the hash and never holds a usable key at rest — see §11.2.
+	TokenHash string `json:"token_hash,omitempty"`
+}
+
+// Mode distinguishes the agent connection protocols (§11).
+type Mode string
+
+const (
+	ModeE2E  Mode = "e2e"
+	ModeHTTP Mode = "http"
+	// ModeDual carries both lanes on one socket: sealed session traffic on
+	// 0x01/0x02 and the OpenAI endpoint's plaintext on 0x03. The agent is
+	// registered in both the pair map and the token-hash map, and the two
+	// lanes keep their own rate budgets — see Server.serveDualAgent.
+	ModeDual Mode = "dual"
+)
+
+// WantsHTTPLane reports whether this mode asks for OpenAI-endpoint
+// routing, i.e. whether the hello's TokenHash is meaningful.
+func (m Mode) WantsHTTPLane() bool {
+	return m == ModeHTTP || m == ModeDual
+}
+
+// Normalized reports the effective mode, treating an absent field as the
+// E2E default so pre-§11 agents keep working unchanged.
+func (m Mode) Normalized() Mode {
+	if m == "" {
+		return ModeE2E
+	}
+	return m
 }
 
 func NewHello(role Role, pairB64 string) Hello {
@@ -43,6 +82,26 @@ type PeerStatus struct {
 
 func PeerOnline() PeerStatus  { return PeerStatus{T: "peer_online"} }
 func PeerOffline() PeerStatus { return PeerStatus{T: "peer_offline"} }
+
+// Rekey is the one control message an agent may send after its hello
+// (§11.3). It republishes the API-key hash the agent is now accepting so
+// the relay can re-index the connection in place, without the reconnect
+// that publishing a new hash in a fresh hello would otherwise require.
+//
+// An empty TokenHash removes the connection from the token index
+// entirely — that is how switching the OpenAI endpoint off stops
+// resolving keys without disturbing the paired browser session sharing
+// the same socket.
+type Rekey struct {
+	T         string `json:"t"` // "rekey"
+	TokenHash string `json:"token_hash"`
+}
+
+// ControlType peeks at just the `t` field, so a reader can dispatch a
+// control message without committing to a concrete shape first.
+type ControlType struct {
+	T string `json:"t"`
+}
 
 // ErrorCode enumerates the control-channel error codes (spec §3).
 type ErrorCode string

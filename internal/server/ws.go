@@ -16,6 +16,7 @@ import (
 
 	"github.com/OpenCharUI/relay/internal/auth"
 	"github.com/OpenCharUI/relay/internal/hub"
+	"github.com/OpenCharUI/relay/internal/logging"
 	"github.com/OpenCharUI/relay/internal/wire"
 )
 
@@ -93,6 +94,30 @@ func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request, role wire
 		s.closeProto(conn, wire.CloseBadFrame, "bad_frame")
 		return
 	}
+	mode := hello.Mode.Normalized()
+	// Only an agent may ask for the HTTP lane: the client half of that
+	// path is the relay's own HTTP handler, never a WebSocket peer. A
+	// client claiming it is either confused or probing.
+	if mode.WantsHTTPLane() && role != wire.RoleAgent {
+		s.m.ConnectionsTotal.WithLabelValues(string(role), "rejected").Inc()
+		s.closeProto(conn, wire.CloseBadFrame, "bad_frame")
+		return
+	}
+	if mode == wire.ModeHTTP && !s.cfg.HTTPEnabled {
+		// An http-only connection has no other purpose, so there is
+		// nothing to degrade to.
+		s.m.ConnectionsTotal.WithLabelValues(string(role), "rejected").Inc()
+		s.closeProto(conn, wire.CloseCapacity, "http_disabled")
+		return
+	}
+	if mode == wire.ModeDual && !s.cfg.HTTPEnabled {
+		// A dual connection's primary job is the pairing; the HTTP lane is
+		// an add-on. Refusing the whole socket because the operator turned
+		// the endpoint off would take the user's browser pairing down with
+		// it, so degrade instead.
+		s.log.Info("dual agent degraded to e2e: http endpoint disabled", "conn", conn.ID())
+		mode = wire.ModeE2E
+	}
 
 	grant, err := s.authz.Authorize(r.Context(), pairID, auth.ConnMeta{
 		Role:      auth.Role(role),
@@ -112,10 +137,18 @@ func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request, role wire
 	sessionStart := time.Now()
 	s.sendHelloOK(conn)
 
-	switch role {
-	case wire.RoleAgent:
+	switch {
+	case role == wire.RoleAgent && mode == wire.ModeHTTP:
+		s.serveHTTPAgent(r.Context(), pairID, conn, hello.TokenHash)
+	case role == wire.RoleAgent && mode == wire.ModeDual:
+		s.serveDualAgent(r.Context(), pairID, conn, hello.TokenHash)
+	// Any other mode value — including one this build does not know —
+	// serves the ordinary E2E path. That leniency is deliberate: it is
+	// what lets a newer agent roll out against an older relay and still
+	// get its pairing, losing only the lane the old relay cannot route.
+	case role == wire.RoleAgent:
 		s.serveAgent(r.Context(), pairID, conn)
-	case wire.RoleClient:
+	case role == wire.RoleClient:
 		s.serveClient(r.Context(), pairID, conn)
 	}
 
@@ -138,7 +171,7 @@ func (s *Server) serveAgent(ctx context.Context, id hub.PairID, conn *hub.Conn) 
 
 	s.notifyPeerOnline(pair, conn)
 
-	s.pump(ctx, pair, conn)
+	s.pump(ctx, pair, nil, conn)
 
 	// Shutdown() (see server.go) already broadcasts going_away and closes
 	// every tracked connection itself, including this one — that close is
@@ -153,6 +186,12 @@ func (s *Server) serveAgent(ctx context.Context, id hub.PairID, conn *hub.Conn) 
 		return
 	}
 
+	s.retireAgent(id, conn)
+}
+
+// retireAgent runs the ordinary "agent disappeared" cleanup for the E2E
+// registry: drop the pair and tell any attached client why.
+func (s *Server) retireAgent(id hub.PairID, conn *hub.Conn) {
 	client, removed := s.hub.RemoveIfAgent(id, conn)
 	if removed {
 		s.m.PairsActive.Set(float64(s.hub.Len()))
@@ -161,6 +200,79 @@ func (s *Server) serveAgent(ctx context.Context, id hub.PairID, conn *hub.Conn) 
 			s.closeProto(client, wire.CloseAgentGone, "agent_gone")
 		}
 	}
+}
+
+// serveDualAgent serves an agent that carries both lanes on one socket
+// (spec §11, ModeDual): the PSK-paired browser session on 0x01/0x02 and
+// the OpenAI endpoint's plaintext on 0x03.
+//
+// The connection is registered in both the pair map and the token-hash
+// map, and it is a single WebSocket, so the two lanes share a fate — but
+// deliberately nothing else. They keep separate rate budgets (see pump),
+// and each is dispatched against its own allowlist on the agent side.
+//
+// Every failure to establish the HTTP lane degrades to a plain E2E
+// agent rather than dropping the connection. The pairing is this
+// socket's primary job; a user must not lose their browser session
+// because a token hash was malformed or the token registry is full.
+func (s *Server) serveDualAgent(ctx context.Context, id hub.PairID, conn *hub.Conn, tokenHashB64 string) {
+	pair, displaced, err := s.hub.RegisterAgent(id, conn)
+	if err != nil {
+		s.closeProto(conn, wire.CloseCapacity, "capacity")
+		return
+	}
+	if displaced != nil {
+		s.closeDisplaced(displaced)
+	}
+	s.m.PairsActive.Set(float64(s.hub.Len()))
+
+	var httpPair *hub.HTTPPair
+	if h, err := hub.ParseTokenHash(tokenHashB64); err != nil {
+		s.log.Warn("dual agent degraded to e2e: malformed token hash", "conn", conn.ID())
+	} else if hp, hpDisplaced, err := s.httpReg.RegisterAgent(h, id, conn); err != nil {
+		s.log.Warn("dual agent degraded to e2e: http registry at capacity", "conn", conn.ID())
+	} else {
+		httpPair = hp
+		// The previous holder of this token is usually the same connection
+		// the pair map just displaced; closing it twice would double-count
+		// the close metric for one event.
+		if hpDisplaced != nil && hpDisplaced != displaced {
+			s.closeDisplaced(hpDisplaced)
+		}
+		s.log.Info("dual agent registered",
+			"conn", conn.ID(),
+			"token", logging.TokenTag(h),
+			"http_live", s.httpReg.Len(),
+		)
+	}
+
+	kind := "agent_dual"
+	if httpPair == nil {
+		kind = "agent"
+	}
+	s.m.ConnectionsActive.WithLabelValues(kind, conn.Grant().Tier).Inc()
+	defer s.m.ConnectionsActive.WithLabelValues(kind, conn.Grant().Tier).Dec()
+
+	s.notifyPeerOnline(pair, conn)
+
+	s.pump(ctx, pair, httpPair, conn)
+
+	// See serveAgent: during a shutdown, Shutdown() already owns notifying
+	// and closing every tracked connection, and detaching here would race
+	// it on both registries.
+	if s.shuttingDown.Load() {
+		return
+	}
+
+	if httpPair != nil {
+		// Read the hash back rather than reusing the one registered with:
+		// a rekey (§11.3) may have re-indexed this entry since.
+		cur := httpPair.TokenHash()
+		if s.httpReg.DetachAgent(cur, conn) {
+			s.log.Info("dual agent http lane detached", "conn", conn.ID(), "token", logging.TokenTag(cur))
+		}
+	}
+	s.retireAgent(id, conn)
 }
 
 func (s *Server) serveClient(ctx context.Context, id hub.PairID, conn *hub.Conn) {
@@ -180,7 +292,7 @@ func (s *Server) serveClient(ctx context.Context, id hub.PairID, conn *hub.Conn)
 
 	s.notifyPeerOnline(pair, conn)
 
-	s.pump(ctx, pair, conn)
+	s.pump(ctx, pair, nil, conn)
 
 	// See the matching comment in serveAgent: during a shutdown, Shutdown()
 	// already owns notifying and closing every connection, so the ordinary
@@ -214,14 +326,33 @@ func (s *Server) closeDisplaced(c *hub.Conn) {
 	s.closeProto(c, wire.CloseDisplaced, "displaced")
 }
 
-// pump is the forwarding loop: read one outer frame from self, hand it to
-// self's peer. It deliberately does no buffering of its own — the next
-// Read does not happen until the current frame's Write to the peer has
-// completed or timed out, which is what makes backpressure propagate all
-// the way from a slow browser's TCP receive window back to Ollama's
-// response stream (see the build plan's Design reference, "Backpressure:
+// pump is the single read loop for every WebSocket the relay serves,
+// routing each frame by its channel byte:
+//
+//   - 0x01/0x02 are forwarded verbatim to self's peer (the E2E lane).
+//     Requires p; an http-only connection has no session and no peer.
+//   - 0x03 is demultiplexed to the HTTP request that owns its stream_id
+//     (the plain lane). Requires hp.
+//
+// Either lane may be absent: a client or plain E2E agent passes hp == nil,
+// an http-only agent passes p == nil, and a dual agent passes both. A
+// frame for an absent lane is a protocol violation and closes the
+// connection — which is also what now makes the "0x03 is only ever valid
+// on a connection that asked for it" rule true of the server and not just
+// of the endpoints.
+//
+// The two lanes are charged against separate byte buckets on purpose. One
+// socket must not mean one budget: a third-party client hammering
+// inference would otherwise exhaust the pair's bucket and drop the socket
+// the user's browser depends on.
+//
+// It deliberately does no buffering of its own — the next Read does not
+// happen until the current frame's Write to the peer (or Deliver to a
+// stream) has completed or timed out, which is what makes backpressure
+// propagate all the way from a slow consumer back to Ollama's response
+// stream (see the build plan's Design reference, "Backpressure:
 // serialized forwarding, zero buffering").
-func (s *Server) pump(ctx context.Context, p *hub.Pair, self *hub.Conn) {
+func (s *Server) pump(ctx context.Context, p *hub.Pair, hp *hub.HTTPPair, self *hub.Conn) {
 	self.SetReadLimit(int64(s.cfg.MaxFrameBytes) + 1024)
 
 	pingCtx, cancelPing := context.WithCancel(ctx)
@@ -241,49 +372,143 @@ func (s *Server) pump(ctx context.Context, p *hub.Pair, self *hub.Conn) {
 			s.closeProto(self, wire.CloseFrameTooLarge, "frame_too_large")
 			return
 		}
-		if !p.Bucket().AllowN(len(data)) {
-			s.m.RateLimitedTotal.WithLabelValues("pair_bytes").Inc()
-			s.closeProto(self, wire.CloseRateLimited, "rate_limited")
-			return
-		}
 
-		hdr, _, err := wire.ParseOuter(data)
+		// Parsed before the byte bucket is charged, because which bucket
+		// this frame belongs to depends on its channel. A malformed frame
+		// therefore goes uncharged, which costs nothing: it closes the
+		// connection on the spot rather than repeating.
+		hdr, payload, err := wire.ParseOuter(data)
 		if err != nil {
 			s.closeProto(self, wire.CloseBadFrame, "bad_frame")
 			return
 		}
-		if hdr.Channel == wire.ChannelControl {
-			// No control-channel messages are expected from either side
-			// after the initial hello — everything past that point is
-			// opaque ciphertext/handshake data the relay only forwards.
-			s.closeProto(self, wire.CloseBadFrame, "unexpected_control_frame")
+
+		switch hdr.Channel {
+		case wire.ChannelCiphertext, wire.ChannelHandshake:
+			if p == nil {
+				s.closeProto(self, wire.CloseBadFrame, "unexpected_session_frame")
+				return
+			}
+			if !p.Bucket().AllowN(len(data)) {
+				s.m.RateLimitedTotal.WithLabelValues("pair_bytes").Inc()
+				s.closeProto(self, wire.CloseRateLimited, "rate_limited")
+				return
+			}
+			s.m.FramesTotal.WithLabelValues(channelLabel(hdr.Channel), "in").Inc()
+			s.m.BytesTotal.WithLabelValues("in").Add(float64(len(data)))
+
+			peer := p.Peer(self.Role())
+			if peer == nil {
+				s.sendControl(self, wire.NewError(wire.ErrPeerOffline))
+				continue
+			}
+
+			writeStart := time.Now()
+			wctx, cancel := context.WithTimeout(ctx, s.cfg.WriteTimeout)
+			err = peer.Write(wctx, data)
+			cancel()
+			s.m.WriteStall.Observe(time.Since(writeStart).Seconds())
+			if err != nil {
+				// The PEER failed to keep up or is gone — close the peer,
+				// not self. Self is healthy and keeps reading; if/when a
+				// new peer attaches (reconnect/displacement), forwarding
+				// resumes.
+				s.closeProto(peer, wire.CloseWriteTimeout, "write_timeout")
+				continue
+			}
+			s.m.FramesTotal.WithLabelValues(channelLabel(hdr.Channel), "out").Inc()
+			s.m.BytesTotal.WithLabelValues("out").Add(float64(len(data)))
+
+		case wire.ChannelPlain:
+			if hp == nil {
+				s.closeProto(self, wire.CloseBadFrame, "unexpected_plain_frame")
+				return
+			}
+			if !hp.Bucket().AllowN(len(data)) {
+				s.m.RateLimitedTotal.WithLabelValues("pair_bytes").Inc()
+				s.closeProto(self, wire.CloseRateLimited, "rate_limited")
+				return
+			}
+			frames, err := wire.DecodeInnerAll(payload)
+			if err != nil {
+				s.closeProto(self, wire.CloseBadFrame, "bad_frame")
+				return
+			}
+			s.m.FramesTotal.WithLabelValues("plain", "in").Inc()
+			s.m.BytesTotal.WithLabelValues("in").Add(float64(len(data)))
+			for _, f := range frames {
+				stream, ok := hp.Route(f.StreamID)
+				if !ok {
+					// Unknown stream_id: a frame that was already in flight
+					// when the request was cancelled or completed. Spec
+					// §6.1 requires dropping these silently.
+					continue
+				}
+				stream.Deliver(hub.StreamEvent{Type: f.Type, Payload: f.Payload})
+			}
+
+		case wire.ChannelControl:
+			// `rekey` (§11.3) is the one control message allowed after
+			// hello, and only from an agent. A client sending control is
+			// still a protocol violation.
+			if self.Role() != wire.RoleAgent {
+				s.closeProto(self, wire.CloseBadFrame, "unexpected_control_frame")
+				return
+			}
+			s.handleAgentControl(hp, self, payload)
+
+		default:
+			// v1 defines nothing above 0x03.
+			s.closeProto(self, wire.CloseBadFrame, "unexpected_channel")
 			return
 		}
-
-		s.m.FramesTotal.WithLabelValues(channelLabel(hdr.Channel), "in").Inc()
-		s.m.BytesTotal.WithLabelValues("in").Add(float64(len(data)))
-
-		peer := p.Peer(self.Role())
-		if peer == nil {
-			s.sendControl(self, wire.NewError(wire.ErrPeerOffline))
-			continue
-		}
-
-		writeStart := time.Now()
-		wctx, cancel := context.WithTimeout(ctx, s.cfg.WriteTimeout)
-		err = peer.Write(wctx, data)
-		cancel()
-		s.m.WriteStall.Observe(time.Since(writeStart).Seconds())
-		if err != nil {
-			// The PEER failed to keep up or is gone — close the peer, not
-			// self. Self is healthy and keeps reading; if/when a new peer
-			// attaches (reconnect/displacement), forwarding resumes.
-			s.closeProto(peer, wire.CloseWriteTimeout, "write_timeout")
-			continue
-		}
-		s.m.FramesTotal.WithLabelValues(channelLabel(hdr.Channel), "out").Inc()
-		s.m.BytesTotal.WithLabelValues("out").Add(float64(len(data)))
 	}
+}
+
+// handleAgentControl processes a post-hello control message from an agent.
+//
+// Deliberately never closes the connection. An agent that sends a control
+// this build does not understand — a newer amallo against an older relay,
+// or a rekey arriving on a connection whose HTTP lane was degraded away —
+// must not lose its pairing over it, which is the same leniency the mode
+// switch in handleUpgrade applies for the same reason.
+func (s *Server) handleAgentControl(hp *hub.HTTPPair, self *hub.Conn, payload []byte) {
+	var ct wire.ControlType
+	if err := json.Unmarshal(payload, &ct); err != nil {
+		s.log.Warn("agent sent unparseable control", "conn", self.ID())
+		return
+	}
+	if ct.T != "rekey" {
+		s.log.Warn("agent sent unknown control", "conn", self.ID(), "t", ct.T)
+		return
+	}
+	if hp == nil {
+		// No HTTP lane on this connection (plain E2E agent, or a dual one
+		// that degraded). Nothing to re-index.
+		s.log.Info("ignoring rekey: connection has no http lane", "conn", self.ID())
+		return
+	}
+
+	var rk wire.Rekey
+	if err := json.Unmarshal(payload, &rk); err != nil {
+		s.log.Warn("agent sent malformed rekey", "conn", self.ID())
+		return
+	}
+	if rk.TokenHash == "" {
+		s.httpReg.Unregister(hp)
+		s.log.Info("http lane unregistered by rekey", "conn", self.ID())
+		return
+	}
+	th, err := hub.ParseTokenHash(rk.TokenHash)
+	if err != nil {
+		s.log.Warn("agent sent rekey with a malformed token hash", "conn", self.ID())
+		return
+	}
+	if err := s.httpReg.Rekey(hp, th); err != nil {
+		s.log.Warn("rekey refused", "conn", self.ID(), "err", err)
+		return
+	}
+	s.log.Info("http lane rekeyed", "conn", self.ID(), "token", logging.TokenTag(th))
 }
 
 func channelLabel(ch wire.Channel) string {
@@ -292,6 +517,8 @@ func channelLabel(ch wire.Channel) string {
 		return "ciphertext"
 	case wire.ChannelHandshake:
 		return "handshake"
+	case wire.ChannelPlain:
+		return "plain"
 	default:
 		return "control"
 	}

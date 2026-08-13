@@ -1,20 +1,58 @@
 relay.opencharui.com {
+	# One hostname serves both protocols: the WebSocket pairing endpoints
+	# (/v1/agent, /v1/client) and the OpenAI-compatible HTTP endpoint
+	# (spec §11). Same origin, one certificate, one thing for a user to
+	# configure — and amallo derives the HTTP base URL from the relay URL
+	# by swapping the scheme, which only holds if they share a host.
+	#
 	# Caddy v2 proxies WebSocket upgrades transparently — no matcher needed.
-	# Deliberately NO `encode` (payloads past the handshake are AES-GCM
-	# ciphertext — incompressible, and compressing plaintext ahead of
-	# encryption is a CRIME-shaped hazard) and NO transport timeouts
-	# (sessions are long-lived; Caddy has no idle timeout by default, which
-	# is exactly what's needed for a socket an agent parks for hours).
 	reverse_proxy 127.0.0.1:8080
+
+	# Deliberately NO `encode`:
+	#   - past the handshake, pairing payloads are AES-GCM ciphertext —
+	#     incompressible, and compressing plaintext ahead of encryption is
+	#     a CRIME-shaped hazard;
+	#   - SSE responses on the OpenAI endpoint must not be buffered by a
+	#     compressor, or token streaming collapses into one blob at the end.
+	#
+	# And NO transport timeouts: agent sockets stay parked for hours, and a
+	# streamed completion legitimately runs for minutes with long gaps. Caddy
+	# has no idle timeout by default, which is exactly what's needed. The
+	# relay sends SSE keepalive comments through cold-model-load gaps
+	# (RELAY_HTTP_KEEPALIVE_INTERVAL), but nothing upstream should be
+	# counting seconds anyway.
 
 	log {
 		output file /var/log/caddy/relay.log
-		format json
+		format filter {
+			wrap json
+			# API keys arrive as the FIRST PATH SEGMENT for clients that
+			# only accept a base URL. Without this filter every user's key
+			# is written to disk in plaintext on every request — and then
+			# to wherever these logs are shipped.
+			#
+			# The pattern targets the `41t_` key prefix rather than "any
+			# first segment", because this host also serves paths whose
+			# first segment is meaningful (/v1/agent, /v1/client, /healthz)
+			# and must stay readable. This is one of the concrete payoffs
+			# of giving keys a fixed prefix.
+			#
+			# Requests that pass the key as `Authorization: Bearer` have no
+			# secret in the URL and need no redaction; Caddy does not log
+			# request headers by default, so the bearer form is unaffected.
+			fields {
+				request>uri regexp "^/41t_[^/?]+" "/41t_[redacted]"
+			}
+		}
 	}
 }
 
 # If this host instead fronts things with nginx-proxy-manager or Traefik
-# rather than Caddy, check the idle/read timeout explicitly — nginx's
-# default 60s proxy_read_timeout will silently kill parked agent sockets,
-# which is exactly the failure mode this Caddy config avoids by having no
-# idle timeout at all.
+# rather than Caddy:
+#   - check the idle/read timeout explicitly — nginx's default 60s
+#     proxy_read_timeout will silently kill parked agent sockets, which is
+#     exactly the failure mode this Caddy config avoids by having no idle
+#     timeout at all;
+#   - disable response buffering, or SSE streaming will not work;
+#   - reproduce the access-log redaction above, or you will accumulate a
+#     file full of working API keys.
