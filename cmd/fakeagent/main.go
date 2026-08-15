@@ -90,6 +90,9 @@ type reqHeader struct {
 type streamState struct {
 	bodyWriter *io.PipeWriter
 	cancel     context.CancelFunc
+	// Which session this request arrived under. A response is only sent
+	// while that session is still current — see testclient.SendInnerAt.
+	epoch uint64
 }
 
 type agent struct {
@@ -141,11 +144,12 @@ func (a *agent) handleReq(ctx context.Context, f wire.InnerFrame) {
 
 	pr, pw := io.Pipe()
 	streamCtx, cancel := context.WithCancel(ctx)
+	epoch := a.t.Epoch()
 	a.mu.Lock()
-	a.streams[f.StreamID] = &streamState{bodyWriter: pw, cancel: cancel}
+	a.streams[f.StreamID] = &streamState{bodyWriter: pw, cancel: cancel, epoch: epoch}
 	a.mu.Unlock()
 
-	go a.serve(streamCtx, f.StreamID, h, pr)
+	go a.serve(streamCtx, f.StreamID, epoch, h, pr)
 }
 
 func (a *agent) handleReqBody(f wire.InnerFrame) {
@@ -186,7 +190,7 @@ func (a *agent) lookupStream(id uint32) *streamState {
 	return a.streams[id]
 }
 
-func (a *agent) serve(ctx context.Context, streamID uint32, h reqHeader, body io.Reader) {
+func (a *agent) serve(ctx context.Context, streamID uint32, epoch uint64, h reqHeader, body io.Reader) {
 	defer func() {
 		a.mu.Lock()
 		delete(a.streams, streamID)
@@ -194,33 +198,33 @@ func (a *agent) serve(ctx context.Context, streamID uint32, h reqHeader, body io
 	}()
 
 	if a.upstream == "" {
-		a.serveEcho(ctx, streamID, h, body)
+		a.serveEcho(ctx, streamID, epoch, h, body)
 		return
 	}
-	a.serveProxy(ctx, streamID, h, body)
+	a.serveProxy(ctx, streamID, epoch, h, body)
 }
 
-func (a *agent) serveEcho(ctx context.Context, streamID uint32, h reqHeader, body io.Reader) {
+func (a *agent) serveEcho(ctx context.Context, streamID uint32, epoch uint64, h reqHeader, body io.Reader) {
 	bodyBytes, _ := io.ReadAll(body)
 
 	respHeaders := [][2]string{{"content-type", "application/json"}}
 	respJSON, _ := json.Marshal(map[string]any{"s": 200, "h": respHeaders})
-	if err := a.t.SendInner(ctx, wire.InnerFrame{Type: wire.InnerResp, StreamID: streamID, Payload: respJSON}); err != nil {
+	if err := a.t.SendInnerAt(ctx, epoch, wire.InnerFrame{Type: wire.InnerResp, StreamID: streamID, Payload: respJSON}); err != nil {
 		return
 	}
 
 	echo, _ := json.Marshal(map[string]any{"echo": true, "method": h.M, "path": h.P, "bodyLen": len(bodyBytes)})
-	if err := a.t.SendInner(ctx, wire.InnerFrame{Type: wire.InnerRespBody, StreamID: streamID, Payload: echo}); err != nil {
+	if err := a.t.SendInnerAt(ctx, epoch, wire.InnerFrame{Type: wire.InnerRespBody, StreamID: streamID, Payload: echo}); err != nil {
 		return
 	}
-	_ = a.t.SendInner(ctx, wire.InnerFrame{Type: wire.InnerRespEnd, StreamID: streamID})
+	_ = a.t.SendInnerAt(ctx, epoch, wire.InnerFrame{Type: wire.InnerRespEnd, StreamID: streamID})
 }
 
-func (a *agent) serveProxy(ctx context.Context, streamID uint32, h reqHeader, body io.Reader) {
+func (a *agent) serveProxy(ctx context.Context, streamID uint32, epoch uint64, h reqHeader, body io.Reader) {
 	url := a.upstream + h.P
 	req, err := http.NewRequestWithContext(ctx, h.M, url, body)
 	if err != nil {
-		a.sendError(streamID, err)
+		a.sendError(streamID, epoch, err)
 		return
 	}
 	for _, kv := range h.H {
@@ -232,7 +236,7 @@ func (a *agent) serveProxy(ctx context.Context, streamID uint32, h reqHeader, bo
 		if ctx.Err() != nil {
 			return // cancelled: spec §6.1 — send nothing further
 		}
-		a.sendError(streamID, err)
+		a.sendError(streamID, epoch, err)
 		return
 	}
 	defer resp.Body.Close()
@@ -244,7 +248,7 @@ func (a *agent) serveProxy(ctx context.Context, streamID uint32, h reqHeader, bo
 		}
 	}
 	respJSON, _ := json.Marshal(map[string]any{"s": resp.StatusCode, "h": respHeaders})
-	if err := a.t.SendInner(ctx, wire.InnerFrame{Type: wire.InnerResp, StreamID: streamID, Payload: respJSON}); err != nil {
+	if err := a.t.SendInnerAt(ctx, epoch, wire.InnerFrame{Type: wire.InnerResp, StreamID: streamID, Payload: respJSON}); err != nil {
 		return
 	}
 
@@ -253,7 +257,7 @@ func (a *agent) serveProxy(ctx context.Context, streamID uint32, h reqHeader, bo
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
 			chunk := append([]byte(nil), buf[:n]...)
-			if sendErr := a.t.SendInner(ctx, wire.InnerFrame{Type: wire.InnerRespBody, StreamID: streamID, Payload: chunk}); sendErr != nil {
+			if sendErr := a.t.SendInnerAt(ctx, epoch, wire.InnerFrame{Type: wire.InnerRespBody, StreamID: streamID, Payload: chunk}); sendErr != nil {
 				return
 			}
 		}
@@ -264,14 +268,14 @@ func (a *agent) serveProxy(ctx context.Context, streamID uint32, h reqHeader, bo
 			if ctx.Err() != nil {
 				return
 			}
-			a.sendError(streamID, err)
+			a.sendError(streamID, epoch, err)
 			return
 		}
 	}
-	_ = a.t.SendInner(ctx, wire.InnerFrame{Type: wire.InnerRespEnd, StreamID: streamID})
+	_ = a.t.SendInnerAt(ctx, epoch, wire.InnerFrame{Type: wire.InnerRespEnd, StreamID: streamID})
 }
 
-func (a *agent) sendError(streamID uint32, err error) {
+func (a *agent) sendError(streamID uint32, epoch uint64, err error) {
 	payload, _ := json.Marshal(map[string]string{"code": "upstream_unreachable", "message": err.Error()})
-	_ = a.t.SendInner(context.Background(), wire.InnerFrame{Type: wire.InnerError, StreamID: streamID, Payload: payload})
+	_ = a.t.SendInnerAt(context.Background(), epoch, wire.InnerFrame{Type: wire.InnerError, StreamID: streamID, Payload: payload})
 }
