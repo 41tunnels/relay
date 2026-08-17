@@ -36,6 +36,7 @@ var reservedFirstSegment = map[string]bool{
 	"v1":      true,
 	"healthz": true,
 	"metrics": true,
+	"stats":   true,
 }
 
 // oaiError is the error envelope every OpenAI-compatible client knows how

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/coder/websocket"
 
@@ -24,13 +25,14 @@ import (
 )
 
 type Server struct {
-	cfg     config.Config
-	hub     *hub.Hub
-	httpReg *hub.HTTPRegistry
-	authz   auth.Authorizer
-	ipLim   *limits.IPLimiter
-	m       *metrics.Metrics
-	log     *slog.Logger
+	cfg       config.Config
+	hub       *hub.Hub
+	httpReg   *hub.HTTPRegistry
+	authz     auth.Authorizer
+	ipLim     *limits.IPLimiter
+	m         *metrics.Metrics
+	log       *slog.Logger
+	startedAt time.Time
 
 	connSeq atomic.Uint64
 
@@ -48,13 +50,14 @@ func New(cfg config.Config, h *hub.Hub, authz auth.Authorizer, ipLim *limits.IPL
 		log = slog.Default()
 	}
 	return &Server{
-		cfg:   cfg,
-		hub:   h,
-		authz: authz,
-		ipLim: ipLim,
-		m:     m,
-		log:   log,
-		conns: make(map[*hub.Conn]struct{}),
+		cfg:       cfg,
+		hub:       h,
+		authz:     authz,
+		ipLim:     ipLim,
+		m:         m,
+		log:       log,
+		startedAt: time.Now(),
+		conns:     make(map[*hub.Conn]struct{}),
 		// Constructed here rather than injected: it is an implementation
 		// detail of the HTTP endpoint, not something a caller configures
 		// independently of cfg.
@@ -68,14 +71,15 @@ func New(cfg config.Config, h *hub.Hub, authz auth.Authorizer, ipLim *limits.IPL
 	}
 }
 
-// Handler returns the mux serving /v1/agent, /v1/client and /healthz —
-// exposed separately from Run so tests can drive it via httptest.Server
-// without binding a real port.
+// Handler returns the mux serving /v1/agent, /v1/client, /healthz and
+// /stats — exposed separately from Run so tests can drive it via
+// httptest.Server without binding a real port.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/agent", s.handleAgentUpgrade)
 	mux.HandleFunc("/v1/client", s.handleClientUpgrade)
 	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.HandleFunc("/stats", s.handleStats)
 	if s.cfg.HTTPEnabled {
 		// Catch-all, so both URL shapes land here: /{token}/v1/... and a
 		// bare /v1/... with the key in the Authorization header. The three
