@@ -70,9 +70,17 @@ type Config struct {
 // build plan.
 func Defaults() Config {
 	return Config{
-		Addr:                ":8080",
-		MetricsAddr:         ":9091",
-		AllowedOrigins:      []string{"opencharui.github.io", "localhost:*", "127.0.0.1:*"},
+		Addr:        ":8080",
+		MetricsAddr: ":9091",
+		// Origin carries no security weight here: a connection isn't
+		// trusted until it presents a valid pairing secret or token in the
+		// hello frame, so there's nothing a same-origin check would guard,
+		// and any client that speaks the protocol should be able to pair.
+		// coder/websocket's docs steer away from "*" toward
+		// InsecureSkipVerify, but this codebase already relies on the
+		// literal pattern in the server_test.go config, so this stays
+		// consistent with that rather than introducing a second mechanism.
+		AllowedOrigins:      []string{"*"},
 		MaxFrameBytes:       1 << 20, // 1 MiB
 		MaxPairs:            10000,
 		PingInterval:        30 * time.Second,

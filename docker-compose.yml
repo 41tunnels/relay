@@ -6,7 +6,6 @@ services:
     environment:
       RELAY_ADDR: ":8080"
       RELAY_METRICS_ADDR: ":9091"
-      RELAY_ALLOWED_ORIGINS: "opencharui.github.io,localhost:*,127.0.0.1:*"
       RELAY_TRUST_PROXY: "true"
       RELAY_LOG_FORMAT: "json"
       RELAY_MAX_PAIRS: "10000"
