@@ -1,5 +1,9 @@
 # Relay
 
+*A [41tunnels](https://41tunnels.com) project.*
+
+**The server that lets your browser reach your own Amallo, anywhere.**
+
 Relay is the Go server that lets the OpenCharUI web app talk to a user's
 own **Amallo** desktop agent over the open internet — without a VPN, and
 without the relay ever seeing plaintext.
