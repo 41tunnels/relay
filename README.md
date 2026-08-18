@@ -4,23 +4,15 @@
 
 **The server that lets your browser reach your own Amallo, anywhere.**
 
-Relay is the Go server that lets the OpenCharUI web app talk to a user's
-own **Amallo** desktop agent over the open internet — without a VPN, and
+Relay is the Go server that lets a browser talk to a user's own
+**Amallo** desktop agent over the open internet — without a VPN, and
 without the relay ever seeing plaintext.
 
 ## Why this exists
 
-OpenCharUI is three pieces, developed as separate repos:
-
-| Component | What it is |
-|---|---|
-| `web` | The OpenCharUI PWA — public, served from GitHub Pages |
-| `amallo` | A Rust desktop agent that runs Ollama-backed inference on the user's own machine |
-| `relay` (this repo) | A Go server that lets the two find and reach each other |
-
 `amallo` runs on a machine that's usually behind NAT/CGNAT with no inbound
-ports open, and `web` runs in a browser that can't dial into it directly.
-Something has to sit in the middle.
+ports open, and a browser can't dial into it directly. Something has to
+sit in the middle.
 
 The obvious answer, a VPN mesh like Tailscale/Headscale, doesn't fit: seat
 pricing charges per authenticated device on an app with many end users, and
@@ -96,7 +88,7 @@ internet-facing. A few of the more consequential ones:
 |---|---|---|
 | `RELAY_ADDR` | `:8080` | Public listener |
 | `RELAY_METRICS_ADDR` | `:9091` | Prometheus listener — bind to loopback only |
-| `RELAY_ALLOWED_ORIGINS` | `opencharui.github.io,localhost:*,127.0.0.1:*` | WebSocket origin allowlist |
+| `RELAY_ALLOWED_ORIGINS` | `*` | WebSocket origin allowlist — wide open by default, since the pairing secret is what actually gates a connection, not the browser origin |
 | `RELAY_MAX_PAIRS` | `10000` | Capacity cap on new pair creation |
 | `RELAY_TRUST_PROXY` | `true` | Trust `X-Forwarded-For` from the reverse proxy in front |
 | `RELAY_HTTP_ENABLED` | `true` | Serve the OpenAI-compatible HTTP endpoint |
