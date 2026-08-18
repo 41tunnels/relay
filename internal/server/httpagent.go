@@ -13,9 +13,9 @@ import (
 	"context"
 	"time"
 
-	"github.com/OpenCharUI/relay/internal/hub"
-	"github.com/OpenCharUI/relay/internal/logging"
-	"github.com/OpenCharUI/relay/internal/wire"
+	"github.com/41tunnels/relay/internal/hub"
+	"github.com/41tunnels/relay/internal/logging"
+	"github.com/41tunnels/relay/internal/wire"
 )
 
 func (s *Server) serveHTTPAgent(ctx context.Context, id hub.PairID, conn *hub.Conn, tokenHashB64 string) {

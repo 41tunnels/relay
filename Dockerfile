@@ -20,7 +20,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -o /out/relay ./cmd/relay
 
 FROM gcr.io/distroless/static-debian12:nonroot
-LABEL org.opencontainers.image.source="https://github.com/OpenCharUI/relay"
+LABEL org.opencontainers.image.source="https://github.com/41tunnels/relay"
 COPY --from=build /out/relay /relay
 EXPOSE 8080 9091
 USER nonroot:nonroot

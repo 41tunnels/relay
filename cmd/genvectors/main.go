@@ -20,8 +20,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/OpenCharUI/relay/internal/proto"
-	"github.com/OpenCharUI/relay/internal/wire"
+	"github.com/41tunnels/relay/internal/proto"
+	"github.com/41tunnels/relay/internal/wire"
 )
 
 func main() {

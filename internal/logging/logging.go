@@ -11,7 +11,7 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/OpenCharUI/relay/internal/config"
+	"github.com/41tunnels/relay/internal/config"
 )
 
 // New builds the process-wide logger per cfg.LogLevel/LogFormat.

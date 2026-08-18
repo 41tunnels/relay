@@ -15,8 +15,8 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/OpenCharUI/relay/internal/auth"
-	"github.com/OpenCharUI/relay/internal/wire"
+	"github.com/41tunnels/relay/internal/auth"
+	"github.com/41tunnels/relay/internal/wire"
 )
 
 // PairID is the 16-byte pairing capability from the QR/manual code (spec

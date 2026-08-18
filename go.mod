@@ -1,4 +1,4 @@
-module github.com/OpenCharUI/relay
+module github.com/41tunnels/relay
 
 go 1.25.0
 

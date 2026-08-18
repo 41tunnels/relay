@@ -18,13 +18,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"github.com/OpenCharUI/relay/internal/auth"
-	"github.com/OpenCharUI/relay/internal/config"
-	"github.com/OpenCharUI/relay/internal/hub"
-	"github.com/OpenCharUI/relay/internal/limits"
-	"github.com/OpenCharUI/relay/internal/logging"
-	"github.com/OpenCharUI/relay/internal/metrics"
-	"github.com/OpenCharUI/relay/internal/server"
+	"github.com/41tunnels/relay/internal/auth"
+	"github.com/41tunnels/relay/internal/config"
+	"github.com/41tunnels/relay/internal/hub"
+	"github.com/41tunnels/relay/internal/limits"
+	"github.com/41tunnels/relay/internal/logging"
+	"github.com/41tunnels/relay/internal/metrics"
+	"github.com/41tunnels/relay/internal/server"
 )
 
 func main() {

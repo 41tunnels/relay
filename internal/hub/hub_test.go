@@ -4,8 +4,8 @@ import (
 	"net/netip"
 	"testing"
 
-	"github.com/OpenCharUI/relay/internal/auth"
-	"github.com/OpenCharUI/relay/internal/wire"
+	"github.com/41tunnels/relay/internal/auth"
+	"github.com/41tunnels/relay/internal/wire"
 )
 
 // fakeConn builds a Conn usable for identity/locking tests — these never

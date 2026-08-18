@@ -19,8 +19,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/OpenCharUI/relay/internal/hub"
-	"github.com/OpenCharUI/relay/internal/wire"
+	"github.com/41tunnels/relay/internal/hub"
+	"github.com/41tunnels/relay/internal/wire"
 )
 
 // reqBodyChunk is the REQ_BODY chunk size. Spec §6 permits up to 256 KiB;

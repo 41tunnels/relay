@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OpenCharUI/relay/internal/wire"
+	"github.com/41tunnels/relay/internal/wire"
 )
 
 func testRegistry() *HTTPRegistry {

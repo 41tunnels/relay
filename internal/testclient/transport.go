@@ -17,8 +17,8 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/OpenCharUI/relay/internal/proto"
-	"github.com/OpenCharUI/relay/internal/wire"
+	"github.com/41tunnels/relay/internal/proto"
+	"github.com/41tunnels/relay/internal/wire"
 )
 
 var (

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/OpenCharUI/relay/internal/wire"
+	"github.com/41tunnels/relay/internal/wire"
 )
 
 // statsSnapshot is the entire public surface of /stats: aggregate counts

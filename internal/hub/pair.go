@@ -4,8 +4,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/OpenCharUI/relay/internal/limits"
-	"github.com/OpenCharUI/relay/internal/wire"
+	"github.com/41tunnels/relay/internal/limits"
+	"github.com/41tunnels/relay/internal/wire"
 )
 
 // Pair is one agent/client slot pair. Its mutex guards only the two

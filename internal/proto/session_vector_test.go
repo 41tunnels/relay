@@ -3,7 +3,7 @@ package proto
 import (
 	"testing"
 
-	"github.com/OpenCharUI/relay/internal/wire"
+	"github.com/41tunnels/relay/internal/wire"
 )
 
 // TestVectorsSession replays the golden chat transcript from session.json:

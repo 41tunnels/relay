@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/OpenCharUI/relay/internal/limits"
-	"github.com/OpenCharUI/relay/internal/wire"
+	"github.com/41tunnels/relay/internal/limits"
+	"github.com/41tunnels/relay/internal/wire"
 )
 
 // TokenHash is the SHA-256 of an API key issued by an agent for the

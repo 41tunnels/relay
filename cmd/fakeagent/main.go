@@ -22,8 +22,8 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/OpenCharUI/relay/internal/testclient"
-	"github.com/OpenCharUI/relay/internal/wire"
+	"github.com/41tunnels/relay/internal/testclient"
+	"github.com/41tunnels/relay/internal/wire"
 )
 
 func main() {
