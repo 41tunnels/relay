@@ -1,7 +1,7 @@
 services:
   relay:
-    image: tehfonsi/opencharui_relay:latest
-    container_name: opencharui-relay
+    image: ghcr.io/41tunnels/relay:latest
+    container_name: relay
     restart: unless-stopped
     environment:
       RELAY_ADDR: ":8080"

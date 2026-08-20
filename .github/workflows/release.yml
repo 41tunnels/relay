@@ -10,7 +10,9 @@ permissions:
 
 concurrency:
   group: release-latest
-  cancel-in-progress: true
+  # Never cancel a run mid-release: a cancelled publish leaves a tag and a
+  # GitHub release with no image behind them.
+  cancel-in-progress: false
 
 jobs:
   test:
@@ -24,28 +26,76 @@ jobs:
       - run: go vet ./...
       - run: go test -race -count=1 ./...
 
-  publish:
+  # Analyzes commits since the last release (conventional commits: feat →
+  # minor, fix → patch, "BREAKING CHANGE"/"!" → major); if one is warranted,
+  # tags it and publishes the GitHub release with generated notes. Nothing is
+  # committed back — a Go module carries no version file, so the tag is the
+  # only thing that needs to move. The image comes from the job below.
+  release:
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      published: ${{ steps.semantic.outputs.new_release_published }}
+      version: ${{ steps.semantic.outputs.new_release_version }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          # semantic-release needs the full commit/tag history to find the
+          # previous release and analyze everything since it — the default
+          # shallow clone only has the latest commit.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+
+      - name: Semantic release
+        id: semantic
+        uses: cycjimmy/semantic-release-action@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Builds the image from the tag the job above just created and pushes it to
+  # GHCR. Only runs when a release actually happened: most pushes to
+  # release/latest (docs, chores, non-release-worthy fixes) publish nothing.
+  publish:
+    needs: release
+    if: needs.release.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: v${{ needs.release.outputs.version }}
 
       - uses: docker/setup-buildx-action@v4
 
-      # Raw-CLI login, same convention as flwkt_website, but --password-stdin
-      # so the secret never lands in the process list or docker's own
-      # command-line history.
-      - name: Log in to Docker Hub
-        run: echo "${{ secrets.DOCKERHUB_PASSWORD }}" | docker login -u tehfonsi --password-stdin
+      # Exports ACTIONS_RUNTIME_TOKEN/ACTIONS_CACHE_URL into the environment.
+      # docker/build-push-action does this itself; a raw `docker buildx` call
+      # does not, and without them the --cache-to/--cache-from below silently
+      # do nothing.
+      - uses: crazy-max/ghaction-github-runtime@v3
 
+      # Raw-CLI login, same convention as the web and website repos, with
+      # --password-stdin so the token never lands in the process list or
+      # docker's own command-line history.
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      # Both tags in one invocation, so :latest always resolves to the version
+      # tag published in the same push.
       - name: Build and push
         run: |
-          SHA="${GITHUB_SHA::12}"
+          VERSION="${{ needs.release.outputs.version }}"
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
-            --build-arg VERSION="$SHA" \
-            --tag tehfonsi/opencharui_relay:latest \
-            --tag "tehfonsi/opencharui_relay:$SHA" \
+            --build-arg VERSION="$VERSION" \
+            --tag "ghcr.io/41tunnels/relay:$VERSION" \
+            --tag ghcr.io/41tunnels/relay:latest \
             --cache-from type=gha \
             --cache-to type=gha,mode=max \
             --provenance=false \
@@ -53,4 +103,4 @@ jobs:
 
       - name: Log out
         if: always()
-        run: docker logout
+        run: docker logout ghcr.io

@@ -126,9 +126,17 @@ numbers.
 
 ## Deployment
 
-Relay ships as a Docker image (`Dockerfile`, multi-arch, distroless) and is
-meant to sit behind a reverse proxy that terminates TLS and proxies
-WebSocket upgrades transparently — see `Caddyfile.example`, which also
+Released versions are published to the GitHub Container Registry:
+
+```bash
+docker run --rm -p 8080:8080 ghcr.io/41tunnels/relay:latest
+```
+
+Images are tagged with the release version (`:1.2.3`) and `:latest`, for
+`linux/amd64` and `linux/arm64`.
+
+Relay is meant to sit behind a reverse proxy that terminates TLS and
+proxies WebSocket upgrades transparently — see `Caddyfile.example`, which also
 notes the two things a different proxy (nginx, Traefik) needs to get
 right: no idle-timeout on the public listener (agent sockets stay parked
 for hours), and no response buffering (SSE streaming depends on it).
@@ -142,6 +150,21 @@ pings with a bounded pong timeout, exponential backoff with jitter
 expected on both clients, bounded server-side buffering per connection
 (no backlog that outlives a slow consumer), and per-pair byte-rate limits
 so one noisy pairing can't starve another.
+
+## Releases
+
+Relay uses [semantic-release](https://semantic-release.gitbook.io). Commit
+messages follow [Conventional Commits](https://www.conventionalcommits.org)
+(`feat:` → minor, `fix:` → patch, `!`/`BREAKING CHANGE` → major), and pushing
+to `release/latest` derives the next version, tags it, publishes GitHub
+release notes and pushes the image to GHCR. Version numbers are never bumped
+by hand.
+
+A push that carries no release-worthy commits (docs, chores) tags nothing and
+publishes no image — the build step is skipped rather than re-pushing
+`:latest` over the same code. The version is stamped into the binary at build
+time and logged at startup, so a running container can be traced back to the
+tag it came from.
 
 ## License
 

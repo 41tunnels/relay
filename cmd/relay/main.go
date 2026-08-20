@@ -27,6 +27,12 @@ import (
 	"github.com/41tunnels/relay/internal/server"
 )
 
+// version is stamped at build time via -ldflags "-X main.version=..." (see
+// Dockerfile); the release workflow passes the semantic-release version, so
+// a running container can be traced back to the tag it was built from.
+// Local `go build` leaves it "dev".
+var version = "dev"
+
 func main() {
 	healthcheck := flag.Bool("healthcheck", false, "probe a locally running relay's /healthz and exit 0/1 (for Docker HEALTHCHECK — distroless has no shell/curl)")
 	flag.Parse()
@@ -72,7 +78,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	log.Info("relay listening", "addr", cfg.Addr, "max_pairs", cfg.MaxPairs)
+	log.Info("relay listening", "addr", cfg.Addr, "max_pairs", cfg.MaxPairs, "version", version)
 	if err := srv.Run(ctx); err != nil {
 		log.Error("relay server error", "err", err)
 		_ = metricsSrv.Shutdown(context.Background())
