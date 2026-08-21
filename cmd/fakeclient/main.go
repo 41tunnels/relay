@@ -23,6 +23,11 @@ import (
 
 const requestStreamID = 1
 
+// Client-initiated stream ids are odd (spec §6), and a new session starts
+// its numbering fresh — but reusing 1 across the break would make a stale
+// frame from the old session indistinguishable from the retry.
+const retryStreamID = 3
+
 func main() {
 	relayURL := flag.String("relay", "ws://localhost:8080", "relay base URL (ws:// or wss://)")
 	pairFlag := flag.String("pair", "", "pair_id, base64url (required — printed by fakeagent on startup)")
@@ -33,6 +38,7 @@ func main() {
 	body := flag.String("body", "", "request body")
 	headerFlag := flag.String("header", "", "comma-separated k:v headers, e.g. 'content-type:application/json'")
 	cancelAfter := flag.Duration("cancel-after", 0, "if >0, send CANCEL this long after the request starts")
+	breakSession := flag.Bool("break-session", false, "after the first response, send a frame this session cannot open, then repeat the request — checks the peer recovers the session in place instead of dropping the connection")
 	timeout := flag.Duration("timeout", 30*time.Second, "overall timeout")
 	flag.Parse()
 
@@ -81,6 +87,56 @@ func main() {
 	}
 
 	readResponse(ctx, t)
+
+	if *breakSession {
+		breakAndRetry(ctx, t, reqJSON, *body)
+	}
+}
+
+// breakAndRetry sends a frame the peer's session cannot open and then
+// repeats the request on the same connection.
+//
+// A peer that treats an unopenable frame as fatal fails the second
+// request: its whole socket is gone and, on the agent side, so is its
+// registration and the OpenAI endpoint's lane with it. A peer that scopes
+// the failure to the session retires it, re-handshakes, and answers.
+func breakAndRetry(ctx context.Context, t *testclient.Transport, reqJSON []byte, body string) {
+	fmt.Fprintln(os.Stderr, "fakeclient: breaking the session with an unopenable frame")
+	if err := t.SendUnopenableCiphertext(ctx); err != nil {
+		log.Fatalf("fakeclient: send unopenable frame: %v", err)
+	}
+
+	// The peer retires its session and offers a new HELLO, and it is
+	// RecvInner that carries that lifecycle — so the reader has to be
+	// running for the new session to be built at all. Start it first, then
+	// wait for the epoch to move before sending anything: a frame sealed
+	// under the dead session would just be dropped by the peer.
+	before := t.Epoch()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		readResponse(ctx, t)
+	}()
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) && t.Epoch() == before {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if t.Epoch() == before {
+		log.Fatal("fakeclient: the peer never rebuilt the session")
+	}
+	fmt.Fprintln(os.Stderr, "fakeclient: session rebuilt in place; retrying on the same connection")
+
+	if err := t.SendInner(ctx, wire.InnerFrame{Type: wire.InnerReq, StreamID: retryStreamID, Payload: reqJSON}); err != nil {
+		log.Fatalf("fakeclient: retry REQ: %v", err)
+	}
+	if body != "" {
+		_ = t.SendInner(ctx, wire.InnerFrame{Type: wire.InnerReqBody, StreamID: retryStreamID, Payload: []byte(body)})
+	}
+	if err := t.SendInner(ctx, wire.InnerFrame{Type: wire.InnerReqEnd, StreamID: retryStreamID}); err != nil {
+		log.Fatalf("fakeclient: retry REQ_END: %v", err)
+	}
+	<-done
 }
 
 func parseClientPairing(pairFlag, pskFlag string, insecure bool) ([16]byte, []byte, error) {

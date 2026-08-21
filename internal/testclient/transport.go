@@ -383,6 +383,25 @@ func (t *Transport) writeFrame(ctx context.Context, ch wire.Channel, payload []b
 	return t.ws.Write(ctx, websocket.MessageBinary, wire.EncodeOuter(ch, payload))
 }
 
+// SendUnopenableCiphertext writes a channel-0x01 frame the peer's current
+// session cannot open — the wire-level shape of "our keys and theirs have
+// diverged", which is what a lost redial notification or a counter gap
+// looks like from the other end.
+//
+// It exists to test what that costs. The answer must be "the session",
+// not "the connection": the peer retires its session, offers a fresh
+// handshake, and everything else on that socket — the OpenAI endpoint's
+// plain lane, the agent's registration — carries on untouched.
+func (t *Transport) SendUnopenableCiphertext(ctx context.Context) error {
+	// Long enough to pass the counter+tag length check, so it fails
+	// authentication rather than being rejected as malformed.
+	payload := make([]byte, 8+16+8)
+	if _, err := rand.Read(payload); err != nil {
+		return err
+	}
+	return t.writeFrame(ctx, wire.ChannelCiphertext, payload)
+}
+
 // SendInner seals (or, in insecure mode, sends verbatim) a single inner
 // frame under the current session. Safe for concurrent use — the internal
 // mutex is exactly the single-sealing-point discipline spec §5.1 requires,
