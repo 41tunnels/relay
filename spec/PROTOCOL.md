@@ -237,7 +237,19 @@ Two consequences for implementers:
   installed. Dropping them strands a request the peer considers sent, and
   §5's exact-counter rule leaves no freedom about the order.
 - Ciphertext arriving with no session established *and none in progress*
-  remains fatal (`4401`): there is no key to authenticate it with.
+  MUST NOT be acted on — there is no key to authenticate it with. It is
+  not, however, grounds for closing the connection: a peer sending
+  ciphertext believes a session exists, so the useful response is to start
+  a handshake (send a HELLO) and let the two sides agree again.
+- The same applies to a frame that fails to open, or that opens to
+  undecodable inner frames: retire the session, offer a fresh HELLO, and
+  keep the connection. See §5.
+
+**A HELLO always begins a new handshake**, whatever state the receiver was
+in — including `established`. That is what makes recovery possible without
+a reconnect, and it is why a `peer_online` that overtakes or replaces a
+HELLO (or is lost entirely) cannot strand a connection: either notification
+alone is enough to start again.
 
 ## 5. Ciphertext channel (0x01)
 
@@ -255,8 +267,21 @@ decrypts, so no explicit direction byte is needed.
 The `counter` is transmitted explicitly (not implicit/tracked-only) so that
 replay and gap detection are simple integer comparisons and test vectors
 are exact. **The receiver's expected counter MUST equal the received
-counter exactly** — no window, no reordering tolerance. Any gap or repeat →
-close `4401 nonce_violation`.
+counter exactly** — no window, no reordering tolerance. Any gap or repeat
+invalidates the session (§4.6): the receiver MUST NOT act on the frame,
+and MUST retire its session rather than continue against a counter
+sequence it no longer agrees on.
+
+Retiring the session is the whole of the required response. Closing the
+connection with `4401 nonce_violation` is permitted but discouraged, and
+no implementation in this repo does it any more: the connection outlives
+the session by design, and on a `mode:"dual"` agent (§11.3) it is also
+carrying the OpenAI endpoint's plain lane and the agent's registration.
+Hanging up takes all of that down and costs both ends a full reconnect,
+where a fresh handshake costs one round trip. An implementation MAY bound
+how many times it will rebuild a session on one connection before giving
+up and reconnecting — a persistent failure is not recoverable in place,
+and retrying it forever is an invisible handshake loop.
 
 Per-frame overhead: `2 (outer header) + 8 (counter) + 16 (GCM tag) = 26
 bytes`, plus the plaintext length.
@@ -272,6 +297,19 @@ two frames encrypted under the same nonce, which breaks AES-GCM
 catastrophically — it leaks the authentication key and reveals the XOR of
 the two plaintexts. This is not a performance-tuning suggestion; it is a
 correctness requirement.
+
+This binds *every* implementation, including ones with no threads. A
+sealing routine that reads the counter, awaits its cipher, and increments
+afterwards has two sealing points the moment two callers overlap across
+that await — which is the normal state of a client with several requests
+in flight. Both frames then go out under one nonce. Two defences, and
+both are cheap:
+
+- serialise the calls, so there is one sealing point in fact and not just
+  in intent (a promise chain, a channel to a single writer task, a mutex);
+- claim the counter *before* the await, never after, so an unserialised
+  caller produces a gap — which the peer rejects — rather than a repeat,
+  which is catastrophic.
 
 - Counter exhaustion (would exceed 2^64-1, in practice: never, but treat
   overflow as fatal) ends the session, never wraps. On a connection that
@@ -341,9 +379,23 @@ for too long.
 
 Both legs run standard RFC 6455 ping/pong: relay pings every
 `RELAY_PING_INTERVAL` (default 30s), and a missing pong within
-`RELAY_PONG_TIMEOUT` (default 15s) closes the connection. This is
-independent of and sufficient for liveness detection — no protocol-level
-ping is layered on top (§6).
+`RELAY_PONG_TIMEOUT` (default 15s) closes the connection. No
+protocol-level ping is layered on top (§6).
+
+That covers the relay's view. It does not cover the endpoint's, and an
+endpoint that only waits to be told is the reason a pairing can appear to
+survive long after it has died: a half-open TCP socket — laptop slept,
+Wi-Fi flipped, CGNAT dropped the mapping — reports nothing at all until
+something is written to it, so a parked agent sits in its read forever
+believing it is online while the relay has long since dropped it.
+
+`hello_ok` therefore carries `ping_ms`, and **an endpoint SHOULD treat
+prolonged silence as a dead connection and redial.** The relay's pings
+arrive unprompted, so any healthy connection produces traffic every
+`ping_ms` even with nothing else happening; several intervals of complete
+silence (this repo's agent uses three, floored at 45s) means the path is
+gone. Received ping and pong frames count as traffic for this purpose —
+they are exactly the signal being relied on.
 
 ## 8. Close codes
 
@@ -352,13 +404,41 @@ ping is layered on top (§6).
 | `1001` | `going_away` — relay is shutting down/restarting; reconnect after `retry_after_ms` with **no** backoff escalation |
 | `4400` | `bad_frame` — malformed outer frame, bad HELLO/CONFIRM, reserved bits set |
 | `4401` | `nonce_violation` — counter gap or repeat |
-| `4404` | `agent_offline` — client connected for a `pair_id` with no registered agent |
+| `4404` | `agent_offline` — client connected for a `pair_id` that has never registered an agent (a pair whose agent has merely gone away is parked instead, see below) |
 | `4408` | `write_timeout` — relay could not write to this socket within `RELAY_WRITE_TIMEOUT` |
 | `4409` | `displaced` — another connection for the same role took this slot; do NOT auto-reconnect, surface "opened on another device" |
-| `4410` | `agent_gone` — the agent side of this pair disconnected |
+| `4410` | `agent_gone` — the agent side of this pair went away and did not come back within `RELAY_AGENT_GRACE` |
 | `4413` | `frame_too_large` |
 | `4429` | `rate_limited` |
 | `4503` | `capacity` — `RELAY_MAX_PAIRS` reached |
+
+### 8.1 Parking: what happens when an agent disconnects
+
+An agent disconnecting does **not** immediately close the client attached
+to it. The relay keeps the pair, agentless, for `RELAY_AGENT_GRACE`
+(default 90s) and sends the client `peer_offline`. Three things can end
+that park:
+
+- **the agent comes back** — it registers into the very same pair, both
+  sides get `peer_online`, and a fresh handshake (§4.6) runs on the
+  client socket that never went anywhere;
+- **the grace window expires** — the client is closed `4410 agent_gone`,
+  which is what it would have received immediately before parking existed,
+  and the pair is dropped;
+- **the client gives up first** — nothing is left to park for, so the pair
+  is dropped at once rather than lingering.
+
+The reason is that an agent restarting, waking from sleep or changing
+network is the ordinary case rather than an exceptional one, and it is
+back within seconds. Closing the client sent it into backoff; if it then
+redialled before the agent had finished reconnecting it got `4404` and
+backed off further, so a two-second blip routinely cost a minute of
+apparent downtime. Parking makes that cost one handshake.
+
+A client attaching during a park is accepted and waits, exactly as one
+whose agent left would. `4404` is reserved for a `pair_id` with no pair at
+all — a client cannot bring a pair into existence, which is what keeps the
+pair map bounded by real agents rather than by connection attempts.
 
 ## 9. Forward-compatibility seams (present in v1, unused)
 
