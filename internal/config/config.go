@@ -27,6 +27,12 @@ type Config struct {
 	PongTimeout   time.Duration
 	HelloTimeout  time.Duration
 	WriteTimeout  time.Duration
+	// AgentGrace is how long a pair is kept alive, agentless, after its
+	// agent disconnects while a client is still attached — the window in
+	// which a restarting or reconnecting agent slots back into the same
+	// pair without the client noticing more than a pause. See the
+	// server's retireAgent.
+	AgentGrace time.Duration
 	ShutdownGrace time.Duration
 
 	PairRateBytesPerSec int64
@@ -87,6 +93,7 @@ func Defaults() Config {
 		PongTimeout:         15 * time.Second,
 		HelloTimeout:        5 * time.Second,
 		WriteTimeout:        30 * time.Second,
+		AgentGrace:          90 * time.Second,
 		ShutdownGrace:       20 * time.Second,
 		PairRateBytesPerSec: 8 << 20, // 8 MiB/s
 		IPConnPerMin:        60,
@@ -135,6 +142,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := setDuration("RELAY_WRITE_TIMEOUT", &c.WriteTimeout); err != nil {
+		return Config{}, err
+	}
+	if err := setDuration("RELAY_AGENT_GRACE", &c.AgentGrace); err != nil {
 		return Config{}, err
 	}
 	if err := setDuration("RELAY_SHUTDOWN_GRACE", &c.ShutdownGrace); err != nil {
@@ -201,6 +211,11 @@ func (c Config) Validate() error {
 	}
 	if c.HelloTimeout <= 0 {
 		return fmt.Errorf("config: RELAY_HELLO_TIMEOUT must be positive, got %s", c.HelloTimeout)
+	}
+	if c.AgentGrace < 0 {
+		// Zero is meaningful: park for no time at all, i.e. the pre-park
+		// behaviour of closing the client the moment its agent goes.
+		return fmt.Errorf("config: RELAY_AGENT_GRACE must not be negative, got %s", c.AgentGrace)
 	}
 	if c.WriteTimeout <= 0 {
 		return fmt.Errorf("config: RELAY_WRITE_TIMEOUT must be positive, got %s", c.WriteTimeout)

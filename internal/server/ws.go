@@ -196,16 +196,59 @@ func (s *Server) serveAgent(ctx context.Context, id hub.PairID, conn *hub.Conn) 
 }
 
 // retireAgent runs the ordinary "agent disappeared" cleanup for the E2E
-// registry: drop the pair and tell any attached client why.
+// registry. If nobody else is on the pair it is dropped; if a client is
+// still attached the pair is *parked* for cfg.AgentGrace instead, and the
+// client is told peer_offline rather than being closed.
+//
+// Parking is the difference between an agent restart costing a pause and
+// costing a full reconnect. An agent that reboots, wakes from sleep or
+// changes network is back within seconds, and it re-registers into the
+// very same pair; the client's socket, TLS session and attachment all
+// survive, so the only thing to redo is the E2E handshake — which both
+// sides already do on every peer_online (spec §4.6). Closing the client
+// instead sent it into backoff, and if it redialled before the agent was
+// back it got 4404 and backed off further, which is how a two-second blip
+// used to turn into a minute of "PC offline".
 func (s *Server) retireAgent(id hub.PairID, conn *hub.Conn) {
-	client, removed := s.hub.RemoveIfAgent(id, conn)
-	if removed {
-		s.m.PairsActive.Set(float64(s.hub.Len()))
-		if client != nil {
-			s.sendControl(client, wire.PeerOffline())
-			s.closeProto(client, wire.CloseAgentGone, "agent_gone")
-		}
+	client, park, kept, ok := s.hub.DetachAgent(id, conn)
+	if !ok {
+		return
 	}
+	s.m.PairsActive.Set(float64(s.hub.Len()))
+	if !kept {
+		return
+	}
+
+	s.sendControl(client, wire.PeerOffline())
+	s.log.Info("agent detached; pair parked for its return",
+		"conn", conn.ID(),
+		"client", client.ID(),
+		"grace", s.cfg.AgentGrace,
+	)
+	time.AfterFunc(s.cfg.AgentGrace, func() { s.expireParkedPair(id, park) })
+}
+
+// expireParkedPair ends a park whose agent never came back, closing
+// whatever client was still waiting on it with the 4410 it would have
+// received immediately before parking existed.
+//
+// Deliberately never cancelled: `park` identifies the park this timer was
+// armed for, so a timer that outlives its park — because the agent came
+// back, or came back and left again into a *newer* park — simply finds
+// nothing to do. That is both simpler and safer than tracking and
+// stopping a timer per park, which would have to get the cancellation
+// race right to avoid cutting a later park short.
+func (s *Server) expireParkedPair(id hub.PairID, park uint64) {
+	client, dropped := s.hub.DropIfParked(id, park)
+	if !dropped {
+		return
+	}
+	s.m.PairsActive.Set(float64(s.hub.Len()))
+	if client == nil {
+		return
+	}
+	s.log.Info("parked pair expired; agent never returned", "client", client.ID())
+	s.closeProto(client, wire.CloseAgentGone, "agent_gone")
 }
 
 // serveDualAgent serves an agent that carries both lanes on one socket
@@ -322,6 +365,13 @@ func (s *Server) serveClient(ctx context.Context, id hub.PairID, conn *hub.Conn)
 	if pair.ClearClient(conn) {
 		if peer := pair.Peer(wire.RoleClient); peer != nil {
 			s.sendControl(peer, wire.PeerOffline())
+			return
+		}
+		// No agent either: this client was the only thing keeping a
+		// parked pair alive, so drop it now rather than leaving an empty
+		// entry until the grace timer gets round to it.
+		if s.hub.DropIfIdle(id) {
+			s.m.PairsActive.Set(float64(s.hub.Len()))
 		}
 	}
 }

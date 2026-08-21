@@ -149,7 +149,7 @@ func TestClearClientStalenessGuard(t *testing.T) {
 	}
 }
 
-func TestRemoveIfAgentTearsDownPair(t *testing.T) {
+func TestDetachAgentParksPairWhileAClientIsAttached(t *testing.T) {
 	h := New(10, 1<<20)
 	id := testPairID(1)
 	agent := fakeConn(wire.RoleAgent)
@@ -157,22 +157,162 @@ func TestRemoveIfAgentTearsDownPair(t *testing.T) {
 	client := fakeConn(wire.RoleClient)
 	pair.SetClient(client)
 
-	gotClient, removed := h.RemoveIfAgent(id, agent)
-	if !removed {
-		t.Fatal("RemoveIfAgent should succeed for the current agent")
+	gotClient, _, kept, ok := h.DetachAgent(id, agent)
+	if !ok {
+		t.Fatal("DetachAgent should succeed for the current agent")
 	}
 	if gotClient != client {
-		t.Error("RemoveIfAgent should return the attached client conn for notification/close")
+		t.Error("DetachAgent should return the attached client conn so it can be told peer_offline")
 	}
-	if _, ok := h.Lookup(id); ok {
-		t.Error("the pair must be gone from the hub after its agent is removed")
+	if !kept {
+		t.Error("a pair with a client still attached must be kept, not dropped")
+	}
+	if _, found := h.Lookup(id); !found {
+		t.Error("the parked pair must still resolve, so the returning agent lands in it")
+	}
+	if pair.HasAgent() {
+		t.Error("the agent slot must be empty while parked")
+	}
+
+	// The whole point of parking: the agent comes back and finds its own
+	// pair, with the same client still sitting in it.
+	agent2 := fakeConn(wire.RoleAgent)
+	pair2, displaced, err := h.RegisterAgent(id, agent2)
+	if err != nil {
+		t.Fatalf("RegisterAgent after a park: %v", err)
+	}
+	if displaced != nil {
+		t.Error("nothing to displace — the previous agent already detached")
+	}
+	if pair2 != pair {
+		t.Error("the returning agent must land in the same pair, not a fresh one")
+	}
+	if pair2.Peer(wire.RoleAgent) != client {
+		t.Error("the client must still be attached after the agent's round trip")
+	}
+}
+
+func TestDetachAgentDropsPairWithNoClient(t *testing.T) {
+	h := New(10, 1<<20)
+	id := testPairID(1)
+	agent := fakeConn(wire.RoleAgent)
+	h.RegisterAgent(id, agent)
+
+	client, _, kept, ok := h.DetachAgent(id, agent)
+	if !ok {
+		t.Fatal("DetachAgent should succeed for the current agent")
+	}
+	if client != nil || kept {
+		t.Error("with nobody attached there is nothing to park for — the pair should just go")
+	}
+	if _, found := h.Lookup(id); found {
+		t.Error("the pair must be gone from the hub")
 	}
 	if h.Len() != 0 {
 		t.Errorf("Len() = %d, want 0", h.Len())
 	}
 }
 
-func TestRemoveIfAgentStalenessGuard(t *testing.T) {
+func TestDropIfAgentlessEndsAPark(t *testing.T) {
+	h := New(10, 1<<20)
+	id := testPairID(1)
+	agent := fakeConn(wire.RoleAgent)
+	pair, _, _ := h.RegisterAgent(id, agent)
+	client := fakeConn(wire.RoleClient)
+	pair.SetClient(client)
+	_, park, _, _ := h.DetachAgent(id, agent)
+
+	gotClient, dropped := h.DropIfParked(id, park)
+	if !dropped {
+		t.Fatal("a parked pair whose grace ran out must be dropped")
+	}
+	if gotClient != client {
+		t.Error("the still-waiting client must be returned so it can be closed 4410")
+	}
+	if h.Len() != 0 {
+		t.Errorf("Len() = %d, want 0", h.Len())
+	}
+}
+
+func TestDropIfAgentlessLeavesAReturnedAgentAlone(t *testing.T) {
+	h := New(10, 1<<20)
+	id := testPairID(1)
+	agent := fakeConn(wire.RoleAgent)
+	pair, _, _ := h.RegisterAgent(id, agent)
+	pair.SetClient(fakeConn(wire.RoleClient))
+	_, park, _, _ := h.DetachAgent(id, agent)
+
+	// The agent beat the grace timer back. The timer still fires — it is
+	// never cancelled — and must do nothing.
+	h.RegisterAgent(id, fakeConn(wire.RoleAgent))
+
+	if _, dropped := h.DropIfParked(id, park); dropped {
+		t.Error("DropIfParked must be a no-op once an agent has reattached")
+	}
+	if _, found := h.Lookup(id); !found {
+		t.Error("the live pair must survive its own expired grace timer")
+	}
+}
+
+func TestAnOldParksTimerCannotCutShortALaterPark(t *testing.T) {
+	h := New(10, 1<<20)
+	id := testPairID(1)
+	client := fakeConn(wire.RoleClient)
+
+	agent1 := fakeConn(wire.RoleAgent)
+	pair, _, _ := h.RegisterAgent(id, agent1)
+	pair.SetClient(client)
+	_, firstPark, _, _ := h.DetachAgent(id, agent1)
+
+	// The agent flaps: back, then gone again. The second departure opens a
+	// park of its own, with its own full grace window.
+	agent2 := fakeConn(wire.RoleAgent)
+	h.RegisterAgent(id, agent2)
+	_, secondPark, _, _ := h.DetachAgent(id, agent2)
+	if secondPark == firstPark {
+		t.Fatal("each park must be distinguishable from the one before it")
+	}
+
+	// The first park's timer now fires. The pair is agentless, so a check
+	// that only looked at the agent slot would drop it — taking away most
+	// of the second park's grace, and the client with it.
+	if _, dropped := h.DropIfParked(id, firstPark); dropped {
+		t.Error("a stale park's timer must not end the park that replaced it")
+	}
+	if _, found := h.Lookup(id); !found {
+		t.Fatal("the pair must survive its previous park's timer")
+	}
+
+	// The current park's own timer still works.
+	gotClient, dropped := h.DropIfParked(id, secondPark)
+	if !dropped || gotClient != client {
+		t.Error("the current park's timer must end it and hand back the waiting client")
+	}
+}
+
+func TestDropIfIdleClearsAParkNobodyIsWaitingOn(t *testing.T) {
+	h := New(10, 1<<20)
+	id := testPairID(1)
+	agent := fakeConn(wire.RoleAgent)
+	pair, _, _ := h.RegisterAgent(id, agent)
+	client := fakeConn(wire.RoleClient)
+	pair.SetClient(client)
+	h.DetachAgent(id, agent)
+
+	if h.DropIfIdle(id) {
+		t.Error("a parked pair with a client still waiting must not be dropped")
+	}
+
+	pair.ClearClient(client)
+	if !h.DropIfIdle(id) {
+		t.Error("once nobody is attached there is nothing left to park for")
+	}
+	if h.Len() != 0 {
+		t.Errorf("Len() = %d, want 0", h.Len())
+	}
+}
+
+func TestDetachAgentStalenessGuard(t *testing.T) {
 	h := New(10, 1<<20)
 	id := testPairID(1)
 	staleAgent := fakeConn(wire.RoleAgent)
@@ -184,13 +324,13 @@ func TestRemoveIfAgentStalenessGuard(t *testing.T) {
 		t.Fatal("setup: expected staleAgent to be displaced")
 	}
 
-	// staleAgent's own cleanup goroutine now runs — it must NOT tear down
+	// staleAgent's own cleanup goroutine now runs — it must NOT disturb
 	// the pair the reconnect already took over.
-	_, removed := h.RemoveIfAgent(id, staleAgent)
-	if removed {
-		t.Error("RemoveIfAgent(staleAgent) must be a no-op once displaced by a newer agent")
+	_, _, _, ok := h.DetachAgent(id, staleAgent)
+	if ok {
+		t.Error("DetachAgent(staleAgent) must be a no-op once displaced by a newer agent")
 	}
-	if _, ok := h.Lookup(id); !ok {
+	if _, found := h.Lookup(id); !found {
 		t.Error("the live pair (with newAgent) must survive the stale agent's cleanup")
 	}
 	if pair.Peer(wire.RoleClient) != newAgent {
@@ -198,10 +338,10 @@ func TestRemoveIfAgentStalenessGuard(t *testing.T) {
 	}
 }
 
-func TestRemoveIfAgentUnknownPair(t *testing.T) {
+func TestDetachAgentUnknownPair(t *testing.T) {
 	h := New(10, 1<<20)
-	_, removed := h.RemoveIfAgent(testPairID(1), fakeConn(wire.RoleAgent))
-	if removed {
-		t.Error("RemoveIfAgent on a never-registered pair_id must report false")
+	_, _, _, ok := h.DetachAgent(testPairID(1), fakeConn(wire.RoleAgent))
+	if ok {
+		t.Error("DetachAgent on a never-registered pair_id must report false")
 	}
 }

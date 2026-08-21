@@ -21,6 +21,14 @@ type Pair struct {
 	mu     sync.Mutex
 	agent  *Conn
 	client *Conn
+	// Incremented every time the agent slot is cleared, so each park can
+	// be told apart from the one before it. A grace timer carries the
+	// number of the park it was armed for and does nothing if that park
+	// has already ended — otherwise an agent that leaves, returns and
+	// leaves again would have its second park cut short by the first
+	// park's timer, which sees an agentless pair and cannot tell that it
+	// is looking at a different one.
+	parkSeq uint64
 }
 
 func newPair(id PairID, bytesPerSec int64) *Pair {
@@ -87,21 +95,57 @@ func (p *Pair) ClearClient(c *Conn) bool {
 	return false
 }
 
-// ClearAgentAndClient nils both slots, but only if the agent slot is
-// still occupied by c (the same staleness guard as ClearClient). Returns
-// the client connection that was attached at the moment of clearing, if
-// any, so the caller can notify and close it — an agent disconnecting
-// takes the whole pair down (spec §8: close code 4410 agent_gone).
-func (p *Pair) ClearAgentAndClient(c *Conn) (client *Conn, cleared bool) {
+// ClearAgent nils the agent slot, but only if it is still occupied by c
+// (the same staleness guard as ClearClient), and leaves the client slot
+// alone. Returns the client that was attached at the moment of clearing,
+// if any, so the caller can tell it the agent went away.
+//
+// It deliberately does NOT evict the client. An agent restarting, waking
+// from sleep or flipping networks is the common case, not an exceptional
+// one, and taking the browser's socket down with it turned a two-second
+// blip into a full reconnect on both sides — with backoff, a fresh TLS
+// handshake and a fresh E2E handshake, all to arrive back where it
+// started. The pair is instead parked agentless for a grace window (see
+// the server's retireAgent): the client stays attached and simply gets
+// peer_offline, and the returning agent's peer_online starts a new
+// session on the socket that never went away.
+func (p *Pair) ClearAgent(c *Conn) (client *Conn, park uint64, cleared bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.agent != c {
+		return nil, 0, false
+	}
+	p.agent = nil
+	p.parkSeq++
+	return p.client, p.parkSeq, true
+}
+
+// endPark reports whether the pair is still sitting in the park numbered
+// `park` — no agent has come back, and no later park has replaced this
+// one — and returns the client still waiting on it, if any.
+func (p *Pair) endPark(park uint64) (client *Conn, ended bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.agent != nil || p.parkSeq != park {
 		return nil, false
 	}
-	client = p.client
-	p.agent = nil
-	p.client = nil
-	return client, true
+	return p.client, true
+}
+
+// isIdle reports whether neither side is attached.
+func (p *Pair) isIdle() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.agent == nil && p.client == nil
+}
+
+// Client returns the currently attached client connection, or nil. Same
+// staleness caveat as Peer: the pointer may go stale the moment it is
+// returned.
+func (p *Pair) Client() *Conn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.client
 }
 
 // HasAgent reports whether an agent is currently attached — used by

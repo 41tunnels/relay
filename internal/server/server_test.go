@@ -277,24 +277,96 @@ func TestAgentDisplacement(t *testing.T) {
 	expectControlType(t, agent2, "hello_ok", 2*time.Second)
 }
 
-func TestAgentGoneTakesPairDown(t *testing.T) {
-	s, ts := newTestServer(t, testConfig())
+func TestAgentGoneParksTheClientThenExpires(t *testing.T) {
+	cfg := testConfig()
+	cfg.AgentGrace = 400 * time.Millisecond
+	s, ts := newTestServer(t, cfg)
 	pairID := randPairID(t)
 	agentConn, clientConn := handshakeAgentAndClient(t, ts, pairID)
 	defer clientConn.CloseNow()
 
 	agentConn.Close(websocket.StatusNormalClosure, "bye")
 
-	errMsg := expectControlType(t, clientConn, "peer_offline", 2*time.Second)
-	_ = errMsg
-	expectClose(t, clientConn, websocket.StatusCode(wire.CloseAgentGone), 2*time.Second)
+	// The client is told the far side went quiet, but is NOT closed: the
+	// agent gets cfg.AgentGrace to come back to the same pair.
+	expectControlType(t, clientConn, "peer_offline", 2*time.Second)
+	if s.hub.Len() != 1 {
+		t.Errorf("hub.Len() = %d, want 1 — the pair is parked, not torn down", s.hub.Len())
+	}
+
+	// Nobody comes back, so the park expires and the client gets the 4410
+	// it would have received immediately before parking existed.
+	expectClose(t, clientConn, websocket.StatusCode(wire.CloseAgentGone), 3*time.Second)
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && s.hub.Len() != 0 {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if s.hub.Len() != 0 {
-		t.Errorf("hub.Len() = %d, want 0 after the agent disconnects (spec §8: agent gone tears down the whole pair)", s.hub.Len())
+		t.Errorf("hub.Len() = %d, want 0 once the grace window has run out", s.hub.Len())
+	}
+}
+
+func TestAgentReturningInsideGraceKeepsTheClientAttached(t *testing.T) {
+	cfg := testConfig()
+	cfg.AgentGrace = 5 * time.Second
+	s, ts := newTestServer(t, cfg)
+	pairID := randPairID(t)
+	agentConn, clientConn := handshakeAgentAndClient(t, ts, pairID)
+	defer clientConn.CloseNow()
+
+	// An agent restart: the socket goes, and comes back moments later.
+	agentConn.Close(websocket.StatusNormalClosure, "restarting")
+	expectControlType(t, clientConn, "peer_offline", 2*time.Second)
+
+	agent2 := dial(t, ts, "/v1/agent")
+	defer agent2.CloseNow()
+	sendHello(t, agent2, wire.RoleAgent, pairID)
+	expectControlType(t, agent2, "hello_ok", 2*time.Second)
+
+	// Both ends are told the pairing is live again, on the client socket
+	// that never went anywhere — so the cost of the restart is one E2E
+	// handshake, not a reconnect on both sides.
+	expectControlType(t, agent2, "peer_online", 2*time.Second)
+	expectControlType(t, clientConn, "peer_online", 2*time.Second)
+
+	if s.hub.Len() != 1 {
+		t.Errorf("hub.Len() = %d, want 1", s.hub.Len())
+	}
+
+	// And the splice really works again, rather than merely looking live.
+	frame := wire.EncodeOuter(wire.ChannelCiphertext, []byte("after the restart"))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := agent2.Write(ctx, websocket.MessageBinary, frame); err != nil {
+		t.Fatalf("write from the returned agent: %v", err)
+	}
+	typ, got, err := clientConn.Read(ctx)
+	if err != nil {
+		t.Fatalf("client read after the agent returned: %v", err)
+	}
+	if typ != websocket.MessageBinary || !bytes.Equal(got, frame) {
+		t.Errorf("forwarded frame = %q, want %q", got, frame)
+	}
+}
+
+func TestParkedPairIsDroppedWhenTheClientGivesUpFirst(t *testing.T) {
+	cfg := testConfig()
+	cfg.AgentGrace = 30 * time.Second // long enough that only the client's exit can clear it
+	s, ts := newTestServer(t, cfg)
+	pairID := randPairID(t)
+	agentConn, clientConn := handshakeAgentAndClient(t, ts, pairID)
+
+	agentConn.Close(websocket.StatusNormalClosure, "bye")
+	expectControlType(t, clientConn, "peer_offline", 2*time.Second)
+	clientConn.Close(websocket.StatusNormalClosure, "closing the tab")
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && s.hub.Len() != 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if s.hub.Len() != 0 {
+		t.Errorf("hub.Len() = %d, want 0 — nothing is left to park for", s.hub.Len())
 	}
 }
 

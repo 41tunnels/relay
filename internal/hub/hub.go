@@ -69,27 +69,67 @@ func (h *Hub) Lookup(id PairID) (*Pair, bool) {
 	return p, ok
 }
 
-// RemoveIfAgent tears the pair down entirely — spec §8: an agent
-// disconnecting closes the whole pair, taking any attached client with it
-// (close code 4410 agent_gone). It only acts if c is still the pair's
-// current agent connection; if c was already displaced by a newer
-// connection (see Pair.SetAgent), this is a no-op and the live pair is
-// left untouched — a stale cleanup goroutine from the old connection must
-// never tear down a pair a reconnect has already taken over.
+// DetachAgent removes c from the agent slot. It only acts if c is still
+// the pair's current agent connection; if c was already displaced by a
+// newer connection (see Pair.SetAgent), this is a no-op and the live pair
+// is left untouched — a stale cleanup goroutine from the old connection
+// must never disturb a pair a reconnect has already taken over.
 //
-// Returns the client connection that was attached at the moment of
-// removal (nil if none), for the caller to notify (peer_offline) and
-// close (4410).
-func (h *Hub) RemoveIfAgent(id PairID, c *Conn) (client *Conn, removed bool) {
+// What happens to the pair depends on whether anyone is still using it:
+//
+//   - a client is attached: the pair is KEPT, agentless, and returned as
+//     kept=true. The caller sends the client peer_offline and arms a
+//     grace window; a returning agent inside that window re-registers
+//     into this same pair and the client never notices more than a pause.
+//   - nobody else is attached: the pair is dropped immediately, because
+//     nothing would be preserved by keeping it.
+//
+// Returns the client attached at the moment of detaching (nil if none),
+// and — when the pair was kept — the park number to arm the grace timer
+// with, which DropIfParked uses to tell this park from any later one.
+func (h *Hub) DetachAgent(id PairID, c *Conn) (client *Conn, park uint64, kept bool, ok bool) {
 	h.mu.RLock()
-	p, ok := h.pairs[id]
+	p, exists := h.pairs[id]
 	h.mu.RUnlock()
-	if !ok {
+	if !exists {
+		return nil, 0, false, false
+	}
+
+	client, park, cleared := p.ClearAgent(c)
+	if !cleared {
+		return nil, 0, false, false
+	}
+	if client != nil {
+		return client, park, true, true
+	}
+
+	h.mu.Lock()
+	if h.pairs[id] == p {
+		delete(h.pairs, id)
+	}
+	h.mu.Unlock()
+	return nil, 0, false, true
+}
+
+// DropIfParked removes a pair once the park numbered `park` has run out of
+// grace without the agent coming back, returning the client that was still
+// waiting on it (nil if it gave up first) so the caller can close it with
+// 4410 agent_gone.
+//
+// A no-op if an agent has since reattached, or if a *later* park has
+// replaced this one — which is why the grace timer never needs
+// cancelling. It fires, finds that the park it was armed for is over, and
+// leaves the pair alone.
+func (h *Hub) DropIfParked(id PairID, park uint64) (client *Conn, dropped bool) {
+	h.mu.RLock()
+	p, exists := h.pairs[id]
+	h.mu.RUnlock()
+	if !exists {
 		return nil, false
 	}
 
-	client, cleared := p.ClearAgentAndClient(c)
-	if !cleared {
+	client, ended := p.endPark(park)
+	if !ended {
 		return nil, false
 	}
 
@@ -98,8 +138,28 @@ func (h *Hub) RemoveIfAgent(id PairID, c *Conn) (client *Conn, removed bool) {
 		delete(h.pairs, id)
 	}
 	h.mu.Unlock()
-
 	return client, true
+}
+
+// DropIfIdle removes a pair nobody is attached to any more — the case
+// where a parked pair's client gives up before the agent returns, leaving
+// an entry with nothing on either side and no reason to keep waiting for
+// its grace timer.
+func (h *Hub) DropIfIdle(id PairID) (dropped bool) {
+	h.mu.RLock()
+	p, exists := h.pairs[id]
+	h.mu.RUnlock()
+	if !exists || !p.isIdle() {
+		return false
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.pairs[id] != p {
+		return false
+	}
+	delete(h.pairs, id)
+	return true
 }
 
 // Len reports the number of currently registered pairs — used for the
